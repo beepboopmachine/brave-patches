@@ -9,5 +9,6 @@ public interface Tab {
     GURL getUrl();
     WebContents getWebContents();
     boolean isIncognito();
+    boolean isClosing();
     Context getContext();
 }

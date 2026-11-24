@@ -3,6 +3,7 @@ package dev.brave.extension.media;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.app.Service;
 import android.content.ContentResolver;
 import android.content.ContentValues;
@@ -21,6 +22,7 @@ import android.os.Environment;
 import android.os.IBinder;
 import android.provider.MediaStore;
 import android.util.Log;
+import dev.brave.extension.core.PatchPrefs;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.ByteArrayOutputStream;
@@ -49,6 +51,7 @@ import javax.crypto.spec.SecretKeySpec;
 public class MediaDownloadService extends Service {
     private static final String TAG = "Brave_DownloadService";
     private static final String CHANNEL_ID = "brave_media_downloads";
+    private static final String CHANNEL_COMPLETE_ID = "brave_media_downloads_complete";
     private static final int NOTIF_ID = 4004;
 
     public static final String ACTION_DOWNLOAD_MEDIA = "dev.brave.action.DOWNLOAD_MEDIA";
@@ -72,10 +75,16 @@ public class MediaDownloadService extends Service {
         createNotificationChannel();
     }
 
+    private static final java.util.concurrent.atomic.AtomicInteger sNextCompletedNotifId = new java.util.concurrent.atomic.AtomicInteger(5000);
+
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        // Android 8.0+ strict requirement: Always call startForeground immediately
+        // to avoid fatal ForegroundServiceDidNotStartInTimeException crash
+        startForeground(NOTIF_ID, buildProgressNotification("Starting media background service...", 0, true));
+
         if (intent == null) {
-            stopSelf();
+            stopForegroundImmediately();
             return START_NOT_STICKY;
         }
 
@@ -87,7 +96,7 @@ public class MediaDownloadService extends Service {
             if (obj instanceof MediaItem) {
                 MediaItem item = (MediaItem) obj;
                 mActiveJobs.incrementAndGet();
-                startForeground(NOTIF_ID, buildProgressNotification("Starting download: " + item.title, 0, true));
+                updateNotification("Starting download: " + item.title, 0, true);
                 mExecutor.execute(() -> {
                     try {
                         processMediaDownload(item);
@@ -105,7 +114,7 @@ public class MediaDownloadService extends Service {
                 boolean convertWebp = intent.getBooleanExtra(EXTRA_CONVERT_WEBP, true);
                 if (!images.isEmpty()) {
                     mActiveJobs.incrementAndGet();
-                    startForeground(NOTIF_ID, buildProgressNotification("Starting image batch download...", 0, true));
+                    updateNotification("Starting image batch download...", 0, true);
                     mExecutor.execute(() -> {
                         try {
                             processBulkImageDownload(images, convertWebp);
@@ -118,8 +127,19 @@ public class MediaDownloadService extends Service {
             }
         }
 
-        checkFinishAndStop();
+        stopForegroundImmediately();
         return START_NOT_STICKY;
+    }
+
+    private void stopForegroundImmediately() {
+        if (mActiveJobs.get() <= 0) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE);
+            } else {
+                stopForeground(true);
+            }
+            stopSelf();
+        }
     }
 
     @Override
@@ -144,6 +164,57 @@ public class MediaDownloadService extends Service {
         }
     }
 
+    private void postCompletedNotification(String title, String message, boolean success) {
+        int notifId = sNextCompletedNotifId.incrementAndGet();
+        Notification.Builder builder;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            builder = new Notification.Builder(this, CHANNEL_COMPLETE_ID);
+        } else {
+            builder = new Notification.Builder(this);
+        }
+
+        builder.setContentTitle(title)
+                .setContentText(message)
+                .setSmallIcon(success ? android.R.drawable.stat_sys_download_done : android.R.drawable.stat_notify_error)
+                .setAutoCancel(true)
+                .setOngoing(false);
+
+        try {
+            Intent viewIntent = new Intent(android.app.DownloadManager.ACTION_VIEW_DOWNLOADS);
+            viewIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                flags |= PendingIntent.FLAG_IMMUTABLE;
+            }
+            PendingIntent pi = PendingIntent.getActivity(this, notifId, viewIntent, flags);
+            builder.setContentIntent(pi);
+        } catch (Throwable ignored) {}
+
+        try {
+            mNotifManager.notify(notifId, builder.build());
+        } catch (Throwable ignored) {}
+    }
+
+    private void registerWithDownloadManager(String title, String filename, String mimeType, File file) {
+        try {
+            android.app.DownloadManager dm = (android.app.DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
+            if (dm != null && file != null && file.exists()) {
+                dm.addCompletedDownload(
+                        filename,
+                        "Downloaded: " + (title != null && !title.isEmpty() ? title : filename),
+                        true,
+                        mimeType,
+                        file.getAbsolutePath(),
+                        file.length(),
+                        true
+                );
+                Log.i(TAG, "Registered completed download with DownloadManager: " + file.getAbsolutePath());
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "Could not register with DownloadManager: " + t.getMessage());
+        }
+    }
+
     // ------------------------------------------------------------------------
     // Media & HLS Stream Processing
     // ------------------------------------------------------------------------
@@ -155,16 +226,18 @@ public class MediaDownloadService extends Service {
             if (item.type == MediaType.HLS_STREAM) {
                 downloadHlsStream(item);
             } else if (item.type == MediaType.DASH_STREAM) {
-                updateNotification("DASH stream download not supported natively", 100, false);
+                postCompletedNotification("Download Unsupported", "DASH streams not supported natively", false);
                 return;
             } else {
                 downloadDirectStream(item);
             }
 
-            updateNotification("Download finished: " + item.title, 100, false);
+            postCompletedNotification("Download Complete", item.title, true);
         } catch (Throwable t) {
             Log.e(TAG, "Download failed for " + item.url, t);
-            updateNotification("Download failed: " + item.title, 100, false);
+            postCompletedNotification("Download Failed", item.title + ": " + t.getMessage(), false);
+        } finally {
+            MediaPickerBottomSheet.ACTIVE_DOWNLOAD_URLS.remove(item.url);
         }
     }
 
@@ -186,6 +259,13 @@ public class MediaDownloadService extends Service {
             throw new IllegalStateException("No media segments found in HLS playlist");
         }
 
+        // Reject DRM protected streams (SAMPLE-AES) cleanly
+        for (HlsParser.SegmentInfo seg : segments) {
+            if (seg.keyInfo != null && seg.keyInfo.isDrm()) {
+                throw new UnsupportedOperationException("DRM protected HLS streams (SAMPLE-AES) are not supported");
+            }
+        }
+
         File tempDir = new File(getCacheDir(), "brave_hls_" + UUID.randomUUID().toString());
         if (!tempDir.mkdirs()) {
             throw new IllegalStateException("Failed creating temporary directory for HLS download");
@@ -193,6 +273,7 @@ public class MediaDownloadService extends Service {
 
         File concatenatedTs = new File(tempDir, "stream_concat.ts");
         Map<String, byte[]> keyCache = new HashMap<>();
+        Map<String, byte[]> initCache = new HashMap<>();
 
         try {
             try (FileOutputStream fos = new FileOutputStream(concatenatedTs);
@@ -203,6 +284,17 @@ public class MediaDownloadService extends Service {
                     HlsParser.SegmentInfo seg = segments.get(i);
                     int progress = (int) (((i + 1) / (float) total) * 85);
                     throttledNotification(String.format(Locale.ROOT, "Downloading segment %d/%d (%s)", i + 1, total, item.title), progress);
+
+                    // Download & write fMP4 / CMAF initialization segment (#EXT-X-MAP) once per init URL
+                    if (seg.initSegmentUrl != null && !seg.initSegmentUrl.isEmpty()) {
+                        if (!initCache.containsKey(seg.initSegmentUrl)) {
+                            byte[] initBytes = fetchBytes(seg.initSegmentUrl, item.userAgent, item.cookie, item.referer);
+                            if (initBytes != null && initBytes.length > 0) {
+                                initCache.put(seg.initSegmentUrl, initBytes);
+                                bos.write(initBytes);
+                            }
+                        }
+                    }
 
                     byte[] segBytes = fetchBytes(seg.url, item.userAgent, item.cookie, item.referer);
                     if (segBytes == null || segBytes.length == 0) continue;
@@ -242,6 +334,11 @@ public class MediaDownloadService extends Service {
 
             Uri targetUri = createMediaUri(sanitizedTitle, outMime);
             saveFileToDestination(finalSource, targetUri, sanitizedTitle);
+
+            File savedFile = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "BraveMedia/" + sanitizedTitle);
+            registerWithDownloadManager(item.title, sanitizedTitle, outMime, savedFile);
+            MediaScannerConnection.scanFile(this, new String[]{savedFile.getAbsolutePath()}, new String[]{outMime}, null);
+            PatchPrefs.markMediaDownloaded(this, item.url, savedFile.getAbsolutePath());
 
         } finally {
             deleteRecursive(tempDir);
@@ -305,9 +402,11 @@ public class MediaDownloadService extends Service {
 
             if (targetUri != null) {
                 completeMediaStoreEntry(targetUri);
-            } else {
-                MediaScannerConnection.scanFile(this, new String[]{new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "BraveMedia/" + filename).getAbsolutePath()}, null, null);
             }
+            File savedFile = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "BraveMedia/" + filename);
+            MediaScannerConnection.scanFile(this, new String[]{savedFile.getAbsolutePath()}, new String[]{mime}, null);
+            registerWithDownloadManager(item.title, filename, mime, savedFile);
+            PatchPrefs.markMediaDownloaded(this, item.url, savedFile.getAbsolutePath());
         } catch (Throwable t) {
             if (targetUri != null) {
                 getContentResolver().delete(targetUri, null, null);
@@ -368,6 +467,8 @@ public class MediaDownloadService extends Service {
                     }
                     completeMediaStoreEntry(targetUri);
                     savedCount++;
+                    File dest = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "BraveMedia/" + filename);
+                    PatchPrefs.markMediaDownloaded(this, item.url, dest.getAbsolutePath());
                 } else {
                     File dl = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "BraveMedia");
                     dl.mkdirs();
@@ -377,13 +478,16 @@ public class MediaDownloadService extends Service {
                     }
                     MediaScannerConnection.scanFile(this, new String[]{dest.getAbsolutePath()}, null, null);
                     savedCount++;
+                    PatchPrefs.markMediaDownloaded(this, item.url, dest.getAbsolutePath());
                 }
             } catch (Throwable t) {
                 Log.w(TAG, "Failed downloading image: " + item.url, t);
             }
         }
 
-        updateNotification(String.format(Locale.ROOT, "Saved %d of %d images to Pictures/BraveMedia", savedCount, total), 100, false);
+        MediaPickerBottomSheet.sBulkImagesDownloading = false;
+        String resultMsg = String.format(Locale.ROOT, "Saved %d of %d images to Pictures/BraveMedia", savedCount, total);
+        postCompletedNotification("Image Batch Complete", resultMsg, savedCount > 0);
     }
 
     private boolean remuxTsToMp4(File inputTs, File outputMp4) {
@@ -621,7 +725,19 @@ public class MediaDownloadService extends Service {
                     NotificationManager.IMPORTANCE_LOW
             );
             channel.setDescription("Background download progress for Brave media");
+            channel.enableVibration(false);
+            channel.setSound(null, null);
+            channel.setShowBadge(false);
             mNotifManager.createNotificationChannel(channel);
+
+            NotificationChannel completeChannel = new NotificationChannel(
+                    CHANNEL_COMPLETE_ID,
+                    "Completed Downloads",
+                    NotificationManager.IMPORTANCE_DEFAULT
+            );
+            completeChannel.setDescription("Notifications when media downloads finish");
+            completeChannel.setShowBadge(true);
+            mNotifManager.createNotificationChannel(completeChannel);
         }
     }
 

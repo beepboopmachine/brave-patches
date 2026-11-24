@@ -81,33 +81,55 @@ val braveCorePatch = patch(
 
         // 5. Bypass Chromium debug ClassLoader mismatch assertion in wp3.attachBaseContext
         ClassLoaderMismatchFingerprint.method.apply {
-            val moveIdx = instructions.indices.indexOfFirst { idx ->
+            val mismatchStringIdx = instructions.indices.indexOfFirst { idx ->
                 val inst = instructions[idx]
-                inst.opcode == Opcode.MOVE_RESULT &&
-                    idx > 0 &&
-                    (instructions[idx - 1] as? ReferenceInstruction)?.reference?.toString()?.contains("equals") == true
+                if (inst.opcode != Opcode.CONST_STRING && inst.opcode != Opcode.CONST_STRING_JUMBO) return@indexOfFirst false
+                (inst as? ReferenceInstruction)?.reference?.toString()?.contains("ClassLoader mismatch detected") == true
             }
-            if (moveIdx >= 0) {
-                val reg = (instructions[moveIdx] as OneRegisterInstruction).registerA
-                addInstructions(
-                    moveIdx + 1,
-                    "const/4 v$reg, 0x1"
-                )
+            if (mismatchStringIdx >= 0) {
+                var targetMoveIdx = -1
+                for (i in mismatchStringIdx - 1 downTo 0) {
+                    val inst = instructions[i]
+                    if (inst.opcode == Opcode.MOVE_RESULT && i > 0) {
+                        val prev = instructions[i - 1]
+                        if ((prev as? ReferenceInstruction)?.reference?.toString()?.contains("equals") == true) {
+                            targetMoveIdx = i
+                            break
+                        }
+                    }
+                }
+                if (targetMoveIdx >= 0) {
+                    val reg = (instructions[targetMoveIdx] as OneRegisterInstruction).registerA
+                    val constInst = if (reg > 15) "const/16 v$reg, 0x1" else "const/4 v$reg, 0x1"
+                    addInstructions(
+                        targetMoveIdx + 1,
+                        constInst
+                    )
+                }
             }
         }
 
-        // 6. Clean up split-APK metadata to allow standalone installation
+        // 6. Clean up split-APK metadata and isolated process tags for clean standalone execution
         resourceXml("AndroidManifest.xml").use { xml ->
             xml.root.removeAttribute("android:isolatedSplits")
             xml.root.removeAttribute("android:requiredSplitTypes")
             xml.root.removeAttribute("android:splitTypes")
             xml.root.removeAttribute("android:isSplitRequired")
 
-            xml.elements("application").firstOrNull()?.let { app ->
-                app.removeAttribute("android:isSplitRequired")
+            val app = xml.elements("application").firstOrNull()
+                ?: throw IllegalStateException("No <application> element found in AndroidManifest.xml")
+
+            app.removeAttribute("android:isSplitRequired")
+            app.removeAttribute("android:zygotePreloadName")
+            app.removeAttribute("android:zygotePreloadNativeLib")
+
+            // Remove AppZygote preload from all services to prevent child process hangs
+            // (Keep NativeOnlySandboxedProcessService* declared so ChildProcessLauncherHelperImpl.getServiceInfo succeeds)
+            app.elements("service").forEach { svc ->
+                svc.removeAttribute("android:useAppZygote")
             }
 
-            xml.elements("meta-data").toList().forEach { meta ->
+            app.elements("meta-data").toList().forEach { meta ->
                 val name = meta.attribute("android:name")
                 if (name == "com.android.vending.splits.required" || name == "com.android.vending.splits") {
                     meta.remove()

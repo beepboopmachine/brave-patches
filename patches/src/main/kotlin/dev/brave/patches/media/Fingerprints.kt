@@ -34,6 +34,13 @@ internal object ToolbarUrlFocusFingerprint : Fingerprint(
     )
 )
 
+internal object ToolbarPhoneDispatchDrawFingerprint : Fingerprint(
+    definingClass = "Lorg/chromium/chrome/browser/toolbar/top/ToolbarPhone;",
+    name = "dispatchDraw",
+    returnType = "V",
+    parameters = listOf("Landroid/graphics/Canvas;")
+)
+
 internal object ActiveTabSwitchFingerprint : Fingerprint(
     definingClass = "Lorg/chromium/chrome/browser/ActivityTabProvider;",
     name = "k",

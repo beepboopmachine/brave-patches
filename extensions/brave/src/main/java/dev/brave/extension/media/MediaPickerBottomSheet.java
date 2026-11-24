@@ -3,6 +3,7 @@ package dev.brave.extension.media;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.Dialog;
+import android.app.DownloadManager;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
@@ -10,19 +11,34 @@ import android.content.Intent;
 import android.graphics.Color;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
+import android.net.Uri;
 import android.os.Build;
+import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.DisplayMetrics;
+import android.util.Log;
 import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
+import android.view.MotionEvent;
+import android.view.VelocityTracker;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.ViewGroup;
 import android.view.Window;
+import android.view.WindowManager;
+import android.view.animation.AccelerateInterpolator;
+import android.view.animation.PathInterpolator;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
@@ -30,103 +46,415 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+
 import dev.brave.extension.core.ActiveTabTracker;
 import dev.brave.extension.core.PatchPrefs;
+import org.chromium.chrome.browser.tab.Tab;
+import org.chromium.content_public.browser.WebContents;
 
 public final class MediaPickerBottomSheet {
     private static final String TAG = "Brave_MediaPicker";
+    private static final PathInterpolator M3_DECELERATE = new PathInterpolator(0.05f, 0.7f, 0.1f, 1.0f);
+    private static final AccelerateInterpolator M3_DISMISS = new AccelerateInterpolator(1.4f);
+
+    // Tracks in-flight downloads across dialog close/reopen cycles
+    public static final Set<String> ACTIVE_DOWNLOAD_URLS = Collections.newSetFromMap(new ConcurrentHashMap<>());
+    public static volatile boolean sBulkImagesDownloading = false;
+
+    private static volatile Method sNativeDownloadUrlMethod = null;
+    private static volatile boolean sNativeDownloadLookupDone = false;
+
+    /**
+     * Nested ScrollView that seamlessly coordinates with GPU-accelerated translationY BottomSheet
+     * drag gestures (zero requestLayout during drag).
+     */
+    public static class SheetScrollView extends ScrollView {
+        public interface ScrollGestureListener {
+            void onDragStart();
+            void onDragDelta(float deltaY);
+            void onDragRelease(float velocityY);
+            boolean canExpand();
+        }
+
+        private ScrollGestureListener mListener;
+        private float mDownY;
+        private float mDownX;
+        private float mLastY;
+        private boolean mIsDraggingSheet;
+        private VelocityTracker mVelocityTracker;
+        private final int mTouchSlop;
+
+        public SheetScrollView(Context context) {
+            super(context);
+            mTouchSlop = ViewConfiguration.get(context).getScaledTouchSlop();
+            setOverScrollMode(OVER_SCROLL_NEVER);
+        }
+
+        public void setScrollGestureListener(ScrollGestureListener listener) {
+            this.mListener = listener;
+        }
+
+        @Override
+        public boolean onInterceptTouchEvent(MotionEvent ev) {
+            if (mListener == null) return super.onInterceptTouchEvent(ev);
+
+            switch (ev.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    mDownY = ev.getRawY();
+                    mDownX = ev.getRawX();
+                    mLastY = mDownY;
+                    mIsDraggingSheet = false;
+                    if (mVelocityTracker == null) mVelocityTracker = VelocityTracker.obtain();
+                    else mVelocityTracker.clear();
+                    mVelocityTracker.addMovement(ev);
+                    super.onInterceptTouchEvent(ev);
+                    return false;
+
+                case MotionEvent.ACTION_MOVE:
+                    float curY = ev.getRawY();
+                    float dy = curY - mDownY;
+                    float dx = ev.getRawX() - mDownX;
+                    if (Math.abs(dy) > mTouchSlop && Math.abs(dy) > Math.abs(dx)) {
+                        if (dy > 0 && getScrollY() <= 0) {
+                            mIsDraggingSheet = true;
+                            mLastY = curY;
+                            mListener.onDragStart();
+                            if (mVelocityTracker != null) mVelocityTracker.addMovement(ev);
+                            return true;
+                        }
+                        if (dy < 0 && mListener.canExpand()) {
+                            mIsDraggingSheet = true;
+                            mLastY = curY;
+                            mListener.onDragStart();
+                            if (mVelocityTracker != null) mVelocityTracker.addMovement(ev);
+                            return true;
+                        }
+                    }
+                    break;
+
+                case MotionEvent.ACTION_CANCEL:
+                case MotionEvent.ACTION_UP:
+                    mIsDraggingSheet = false;
+                    break;
+            }
+            return super.onInterceptTouchEvent(ev);
+        }
+
+        @Override
+        public boolean onTouchEvent(MotionEvent ev) {
+            if (mListener == null) return super.onTouchEvent(ev);
+
+            if (mVelocityTracker == null) mVelocityTracker = VelocityTracker.obtain();
+            mVelocityTracker.addMovement(ev);
+
+            switch (ev.getActionMasked()) {
+                case MotionEvent.ACTION_MOVE:
+                    float curY = ev.getRawY();
+                    if (!mIsDraggingSheet) {
+                        float dy = curY - mDownY;
+                        if ((dy > mTouchSlop && getScrollY() <= 0) || (dy < -mTouchSlop && mListener.canExpand())) {
+                            mIsDraggingSheet = true;
+                            mLastY = curY;
+                            mListener.onDragStart();
+                        }
+                    }
+                    if (mIsDraggingSheet) {
+                        float step = curY - mLastY;
+                        mLastY = curY;
+                        mListener.onDragDelta(step);
+                        return true;
+                    }
+                    break;
+
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    if (mIsDraggingSheet) {
+                        mIsDraggingSheet = false;
+                        float vy = 0f;
+                        if (mVelocityTracker != null) {
+                            mVelocityTracker.computeCurrentVelocity(1000);
+                            vy = mVelocityTracker.getYVelocity();
+                            mVelocityTracker.recycle();
+                            mVelocityTracker = null;
+                        }
+                        mListener.onDragRelease(vy);
+                        return true;
+                    }
+                    if (mVelocityTracker != null) {
+                        mVelocityTracker.recycle();
+                        mVelocityTracker = null;
+                    }
+                    break;
+            }
+            return super.onTouchEvent(ev);
+        }
+    }
 
     public static void show(final Activity activity) {
         if (activity == null || activity.isFinishing()) return;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1 && activity.isDestroyed()) return;
 
-        final int tabId = ActiveTabTracker.getActiveTabId();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (activity.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                try {
+                    activity.requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 101);
+                } catch (Throwable ignored) {}
+            }
+        }
+
+        int resolvedTabId = ActiveTabTracker.getActiveTabId();
+        if (resolvedTabId < 0) {
+            Tab tab = ActiveTabTracker.getActiveTab();
+            if (tab != null) {
+                try {
+                    resolvedTabId = tab.getId();
+                } catch (Throwable ignored) {}
+            }
+        }
+        final int tabId = resolvedTabId >= 0 ? resolvedTabId : 0;
         final List<MediaItem> videos = MediaRegistry.getMediaForTab(tabId);
         final List<MediaItem> images = MediaRegistry.getImagesForTab(tabId);
 
-        final Dialog dialog = new Dialog(activity);
+        final Dialog dialog = new Dialog(activity, android.R.style.Theme_Translucent_NoTitleBar);
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
 
         boolean isDark = isDarkTheme(activity);
-        int bgColor = isDark ? Color.parseColor("#1F1F1F") : Color.WHITE;
+        int bgColor = isDark ? Color.parseColor("#0A0A0C") : Color.WHITE;
         int textColor = isDark ? Color.parseColor("#E3E3E3") : Color.parseColor("#1F1F1F");
         int subTextColor = isDark ? Color.parseColor("#A0A0A0") : Color.parseColor("#666666");
-        int cardBgColor = isDark ? Color.parseColor("#2C2C2C") : Color.parseColor("#F4F4F6");
+        int cardBgColor = isDark ? Color.parseColor("#141416") : Color.parseColor("#F4F4F6");
         int accentColor = Color.parseColor("#FF5500");
 
-        LinearLayout root = new LinearLayout(activity);
+        final DisplayMetrics dm = activity.getResources().getDisplayMetrics();
+        final int screenHeight = dm.heightPixels;
+        final int expandedHeight = (int) (screenHeight * 0.88f);
+        final int normalHeight = (int) (screenHeight * 0.56f);
+        final int halfOffset = expandedHeight - normalHeight;
+        final boolean[] isExpanded = new boolean[]{false};
+        final boolean[] isDismissing = new boolean[]{false};
+
+        // Full-screen overlay container with animated scrim (ZERO window resizes, ZERO bottom gaps)
+        final FrameLayout overlayContainer = new FrameLayout(activity);
+        overlayContainer.setLayoutParams(new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        final View scrim = new View(activity);
+        scrim.setBackgroundColor(Color.BLACK);
+        scrim.setAlpha(0f);
+        scrim.setLayoutParams(new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        overlayContainer.addView(scrim);
+
+        // Fixed-height bottom sheet anchored to bottom; all expansion/collapse/dismiss is 100% GPU translationY!
+        final LinearLayout root = new LinearLayout(activity);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(activity, 20), dp(activity, 12), dp(activity, 20), dp(activity, 20));
+        root.setPadding(dp(activity, 18), dp(activity, 8), dp(activity, 18), 0);
+        FrameLayout.LayoutParams rootLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, expandedHeight);
+        rootLp.gravity = Gravity.BOTTOM;
+        root.setLayoutParams(rootLp);
+        root.setClickable(true);
 
         GradientDrawable rootBg = new GradientDrawable();
         rootBg.setColor(bgColor);
-        float r = dp(activity, 16);
+        float r = dp(activity, 20);
         rootBg.setCornerRadii(new float[]{r, r, r, r, 0, 0, 0, 0});
         root.setBackground(rootBg);
+        overlayContainer.addView(root);
 
-        // Drag handle
+        // Top drag header containing ONLY the drag pill handle (zero branding)
+        LinearLayout dragHeader = new LinearLayout(activity);
+        dragHeader.setOrientation(LinearLayout.VERTICAL);
+        dragHeader.setGravity(Gravity.CENTER_HORIZONTAL);
+        dragHeader.setPadding(0, dp(activity, 6), 0, dp(activity, 12));
+        dragHeader.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
         View handle = new View(activity);
-        LinearLayout.LayoutParams handleLp = new LinearLayout.LayoutParams(dp(activity, 40), dp(activity, 4));
+        LinearLayout.LayoutParams handleLp = new LinearLayout.LayoutParams(dp(activity, 48), dp(activity, 5));
         handleLp.gravity = Gravity.CENTER_HORIZONTAL;
-        handleLp.bottomMargin = dp(activity, 14);
         handle.setLayoutParams(handleLp);
         GradientDrawable handleBg = new GradientDrawable();
-        handleBg.setColor(isDark ? Color.parseColor("#444444") : Color.parseColor("#CCCCCC"));
-        handleBg.setCornerRadius(dp(activity, 2));
+        handleBg.setColor(isDark ? Color.parseColor("#4A4A52") : Color.parseColor("#D0D0D4"));
+        handleBg.setCornerRadius(dp(activity, 3));
         handle.setBackground(handleBg);
-        root.addView(handle);
-
-        // Header Title
-        TextView titleView = new TextView(activity);
-        titleView.setText("Brave Media Downloader");
-        titleView.setTextColor(textColor);
-        titleView.setTextSize(18);
-        titleView.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
-        root.addView(titleView);
+        dragHeader.addView(handle);
+        root.addView(dragHeader);
 
         // Tab Selector Bar
         LinearLayout tabContainer = new LinearLayout(activity);
         tabContainer.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams tabLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-        );
-        tabLp.topMargin = dp(activity, 12);
-        tabLp.bottomMargin = dp(activity, 12);
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        tabLp.bottomMargin = dp(activity, 10);
         tabContainer.setLayoutParams(tabLp);
 
         Button tabVideos = createTabButton(activity, "Videos / Streams (" + videos.size() + ")", true, accentColor, textColor, cardBgColor);
         Button tabImages = createTabButton(activity, "Images (" + images.size() + ")", false, accentColor, textColor, cardBgColor);
-
         tabContainer.addView(tabVideos);
         tabContainer.addView(tabImages);
         root.addView(tabContainer);
 
-        // Compute flexible max height based on screen height
-        DisplayMetrics dm = activity.getResources().getDisplayMetrics();
-        int maxContentHeight = (int) (dm.heightPixels * 0.55f);
+        // Content Area fills remaining fixed height of sheet
+        final FrameLayout contentArea = new FrameLayout(activity);
+        contentArea.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1.0f));
 
-        // Content Area Frame
-        FrameLayout contentArea = new FrameLayout(activity);
-        LinearLayout.LayoutParams contentLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                maxContentHeight
-        );
-        contentArea.setLayoutParams(contentLp);
-
-        // Videos Scroll View
-        ScrollView videoScrollView = new ScrollView(activity);
+        final SheetScrollView videoScrollView = new SheetScrollView(activity);
+        videoScrollView.setClipToPadding(false);
+        videoScrollView.setPadding(0, 0, 0, halfOffset + dp(activity, 24));
         LinearLayout videoList = new LinearLayout(activity);
         videoList.setOrientation(LinearLayout.VERTICAL);
         videoScrollView.addView(videoList);
         contentArea.addView(videoScrollView);
+
+        final SheetScrollView imageScrollView = new SheetScrollView(activity);
+        imageScrollView.setClipToPadding(false);
+        imageScrollView.setPadding(0, 0, 0, halfOffset + dp(activity, 24));
+
+        // Pure GPU translationY settle helper (120fps, zero requestLayout!)
+        final Runnable updateScrollPadding = () -> {
+            int padBottom = isExpanded[0] ? dp(activity, 24) : (halfOffset + dp(activity, 24));
+            videoScrollView.setPadding(0, 0, 0, padBottom);
+            imageScrollView.setPadding(0, 0, 0, padBottom);
+        };
+
+        final Runnable dismissSheet = () -> {
+            if (isDismissing[0] || !dialog.isShowing()) return;
+            isDismissing[0] = true;
+            root.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+            scrim.animate().alpha(0f).setDuration(200).setInterpolator(M3_DISMISS).start();
+            root.animate()
+                    .translationY(expandedHeight)
+                    .setDuration(200)
+                    .setInterpolator(M3_DISMISS)
+                    .withEndAction(() -> {
+                        root.setLayerType(View.LAYER_TYPE_NONE, null);
+                        try { dialog.dismiss(); } catch (Throwable ignored) {}
+                    })
+                    .start();
+        };
+
+        scrim.setOnClickListener(v -> dismissSheet.run());
+        dialog.setOnKeyListener((d, keyCode, event) -> {
+            if (keyCode == android.view.KeyEvent.KEYCODE_BACK && event.getAction() == android.view.KeyEvent.ACTION_UP) {
+                dismissSheet.run();
+                return true;
+            }
+            return false;
+        });
+
+        final java.util.function.Consumer<Boolean> animateToState = (expand) -> {
+            isExpanded[0] = expand;
+            float targetY = expand ? 0f : (float) halfOffset;
+            float targetAlpha = 0.52f;
+            root.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+            scrim.animate().alpha(targetAlpha).setDuration(240).setInterpolator(M3_DECELERATE).start();
+            root.animate()
+                    .translationY(targetY)
+                    .setDuration(240)
+                    .setInterpolator(M3_DECELERATE)
+                    .withEndAction(() -> {
+                        root.setLayerType(View.LAYER_TYPE_NONE, null);
+                        updateScrollPadding.run();
+                    })
+                    .start();
+        };
+
+        final SheetScrollView.ScrollGestureListener scrollGestureListener = new SheetScrollView.ScrollGestureListener() {
+            @Override
+            public void onDragStart() {
+                root.animate().cancel();
+                scrim.animate().cancel();
+                root.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+            }
+
+            @Override
+            public void onDragDelta(float deltaY) {
+                float curY = root.getTranslationY() + deltaY;
+                float clampedY = Math.max(0f, Math.min((float) expandedHeight, curY));
+                root.setTranslationY(clampedY);
+                float progress = 1f - (clampedY / (float) expandedHeight);
+                scrim.setAlpha(Math.max(0f, Math.min(0.52f, 0.52f * progress)));
+            }
+
+            @Override
+            public void onDragRelease(float velocityY) {
+                float curY = root.getTranslationY();
+                if (velocityY > 1100f) {
+                    if (isExpanded[0] && curY < halfOffset) {
+                        animateToState.accept(false);
+                    } else {
+                        dismissSheet.run();
+                    }
+                } else if (velocityY < -1100f) {
+                    animateToState.accept(true);
+                } else if (curY > halfOffset + dp(activity, 75)) {
+                    dismissSheet.run();
+                } else if (curY < halfOffset * 0.55f) {
+                    animateToState.accept(true);
+                } else {
+                    animateToState.accept(false);
+                }
+            }
+
+            @Override
+            public boolean canExpand() {
+                return !isExpanded[0];
+            }
+        };
+
+        videoScrollView.setScrollGestureListener(scrollGestureListener);
+        imageScrollView.setScrollGestureListener(scrollGestureListener);
+
+        // Header drag & tap listener
+        dragHeader.setOnTouchListener(new View.OnTouchListener() {
+            private float downY;
+            private float lastY;
+            private long downTime;
+            private VelocityTracker vt;
+
+            @Override
+            public boolean onTouch(View v, MotionEvent ev) {
+                if (vt == null) vt = VelocityTracker.obtain();
+                vt.addMovement(ev);
+                switch (ev.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                        downY = ev.getRawY();
+                        lastY = downY;
+                        downTime = System.currentTimeMillis();
+                        scrollGestureListener.onDragStart();
+                        return true;
+                    case MotionEvent.ACTION_MOVE:
+                        float cur = ev.getRawY();
+                        scrollGestureListener.onDragDelta(cur - lastY);
+                        lastY = cur;
+                        return true;
+                    case MotionEvent.ACTION_UP:
+                    case MotionEvent.ACTION_CANCEL:
+                        float totalDelta = ev.getRawY() - downY;
+                        long dur = System.currentTimeMillis() - downTime;
+                        vt.computeCurrentVelocity(1000);
+                        float vy = vt.getYVelocity();
+                        vt.recycle();
+                        vt = null;
+                        if (Math.abs(totalDelta) < dp(activity, 10) && dur < 260) {
+                            animateToState.accept(!isExpanded[0]);
+                        } else {
+                            scrollGestureListener.onDragRelease(vy);
+                        }
+                        return true;
+                }
+                return false;
+            }
+        });
 
         // Images Container
         LinearLayout imagesContainer = new LinearLayout(activity);
         imagesContainer.setOrientation(LinearLayout.VERTICAL);
         imagesContainer.setVisibility(View.GONE);
 
-        // Conversion Toggle Bar & Sticky Bulk Button
         LinearLayout convBar = new LinearLayout(activity);
         convBar.setOrientation(LinearLayout.HORIZONTAL);
         convBar.setGravity(Gravity.CENTER_VERTICAL);
@@ -145,26 +473,88 @@ public final class MediaPickerBottomSheet {
         imagesContainer.addView(convBar);
 
         final Set<MediaItem> selectedImages = new HashSet<>();
+        final List<CheckBox> imageCheckBoxes = new ArrayList<>();
+        final List<View> imageRowViews = new ArrayList<>();
         final Button bulkBtn = new Button(activity);
-        bulkBtn.setText(images.isEmpty() ? "No Images" : "Download All (" + images.size() + " Images)");
-        styleButton(bulkBtn, accentColor, Color.WHITE, dp(activity, 8));
-        bulkBtn.setEnabled(!images.isEmpty());
+
+        final Runnable updateBulkButtonState = () -> {
+            if (images.isEmpty()) {
+                bulkBtn.setText("No Images");
+                bulkBtn.setEnabled(false);
+                styleButton(bulkBtn, cardBgColor, subTextColor, dp(activity, 8));
+                return;
+            }
+            if (sBulkImagesDownloading) {
+                bulkBtn.setText("DOWNLOADING IMAGES...");
+                bulkBtn.setEnabled(false);
+                styleButton(bulkBtn, Color.parseColor(isDark ? "#4A2800" : "#FFE0B2"), Color.parseColor(isDark ? "#FFA726" : "#E65100"), dp(activity, 8));
+                return;
+            }
+            List<MediaItem> target = selectedImages.isEmpty() ? images : new ArrayList<>(selectedImages);
+            int alreadyCount = 0;
+            for (MediaItem im : target) {
+                if (PatchPrefs.isMediaDownloaded(activity, im.url)) alreadyCount++;
+            }
+            bulkBtn.setEnabled(true);
+            if (alreadyCount == target.size()) {
+                bulkBtn.setText((selectedImages.isEmpty() ? "ALL DOWNLOADED ✓ (" : "SELECTED DOWNLOADED ✓ (") + target.size() + " Images)");
+                styleButton(bulkBtn, Color.parseColor(isDark ? "#143D1A" : "#D4EDDA"), Color.parseColor(isDark ? "#81C784" : "#155724"), dp(activity, 8));
+            } else {
+                String label = selectedImages.isEmpty()
+                        ? ("Download All (" + target.size() + " Images)")
+                        : ("Download Selected (" + target.size() + " Images)");
+                if (alreadyCount > 0) {
+                    label = label + " • " + (target.size() - alreadyCount) + " new";
+                }
+                bulkBtn.setText(label);
+                styleButton(bulkBtn, accentColor, Color.WHITE, dp(activity, 8));
+            }
+        };
+
+        updateBulkButtonState.run();
+
         bulkBtn.setOnClickListener(v -> {
-            List<MediaItem> targetImages = selectedImages.isEmpty() ? images : new ArrayList<>(selectedImages);
-            startBulkImageDownload(activity, targetImages, convPng.isChecked());
-            dialog.dismiss();
+            final List<MediaItem> targetImages = selectedImages.isEmpty() ? images : new ArrayList<>(selectedImages);
+            final List<MediaItem> notYetDownloaded = new ArrayList<>();
+            for (MediaItem im : targetImages) {
+                if (!PatchPrefs.isMediaDownloaded(activity, im.url)) {
+                    notYetDownloaded.add(im);
+                }
+            }
+
+            if (notYetDownloaded.isEmpty()) {
+                new AlertDialog.Builder(activity)
+                        .setTitle("Images Already Downloaded")
+                        .setMessage("All " + targetImages.size() + " images have already been downloaded.\n\nDo you want to download them again?")
+                        .setPositiveButton("Download Again", (d, w) -> {
+                            launchBulkImageDownload(activity, targetImages, convPng.isChecked(), bulkBtn, isDark);
+                        })
+                        .setNegativeButton("Cancel", null)
+                        .show();
+            } else if (notYetDownloaded.size() < targetImages.size()) {
+                int already = targetImages.size() - notYetDownloaded.size();
+                new AlertDialog.Builder(activity)
+                        .setTitle("Some Images Already Downloaded")
+                        .setMessage(already + " of " + targetImages.size() + " images were already downloaded.")
+                        .setPositiveButton("Download " + notYetDownloaded.size() + " New Only", (d, w) -> {
+                            launchBulkImageDownload(activity, notYetDownloaded, convPng.isChecked(), bulkBtn, isDark);
+                        })
+                        .setNeutralButton("Download All (" + targetImages.size() + ")", (d, w) -> {
+                            launchBulkImageDownload(activity, targetImages, convPng.isChecked(), bulkBtn, isDark);
+                        })
+                        .setNegativeButton("Cancel", null)
+                        .show();
+            } else {
+                launchBulkImageDownload(activity, targetImages, convPng.isChecked(), bulkBtn, isDark);
+            }
         });
         imagesContainer.addView(bulkBtn);
 
-        ScrollView imageScrollView = new ScrollView(activity);
         LinearLayout.LayoutParams imgScrollLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                0,
-                1.0f
-        );
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1.0f);
         imgScrollLp.topMargin = dp(activity, 6);
         imageScrollView.setLayoutParams(imgScrollLp);
-        LinearLayout imageList = new LinearLayout(activity);
+        final LinearLayout imageList = new LinearLayout(activity);
         imageList.setOrientation(LinearLayout.VERTICAL);
         imageScrollView.addView(imageList);
         imagesContainer.addView(imageScrollView);
@@ -174,33 +564,142 @@ public final class MediaPickerBottomSheet {
 
         // Populate Videos Tab
         if (videos.isEmpty()) {
-            TextView emptyView = createEmptyState(activity, "No video or audio streams detected on this page.", subTextColor);
-            videoList.addView(emptyView);
+            videoList.addView(createEmptyState(activity, "No video or audio streams detected on this page.", subTextColor));
         } else {
-            for (final MediaItem item : videos) {
-                View card = createVideoCard(activity, item, isDark, cardBgColor, textColor, subTextColor, accentColor, dialog);
-                videoList.addView(card);
+            for (int i = 0; i < videos.size(); i++) {
+                videoList.addView(createVideoCard(activity, videos.get(i), i, videos.size(), isDark, cardBgColor, textColor, subTextColor, accentColor));
             }
         }
 
-        // Populate Images Tab
-        if (images.isEmpty()) {
-            TextView emptyView = createEmptyState(activity, "No high-resolution images detected on this page.", subTextColor);
-            imageList.addView(emptyView);
-        } else {
-            for (final MediaItem item : images) {
-                View imgCard = createImageCard(activity, item, cardBgColor, textColor, subTextColor, selectedImages, () -> {
-                    if (selectedImages.isEmpty()) {
-                        bulkBtn.setText("Download All (" + images.size() + " Images)");
-                    } else {
-                        bulkBtn.setText("Download Selected (" + selectedImages.size() + " Images)");
+        // Google Photos-style Drag Select Controller
+        class DragSelectController implements DragSelectListener {
+            boolean isDragSelecting = false;
+            int dragStartIndex = -1;
+            boolean isSelectMode = true;
+            final Set<Integer> preDragSelection = new HashSet<>();
+            int autoScrollStep = 0;
+            final Handler handler = new Handler(Looper.getMainLooper());
+            int lastRawY = 0;
+
+            final Runnable autoScrollRunnable = new Runnable() {
+                @Override
+                public void run() {
+                    if (isDragSelecting && autoScrollStep != 0) {
+                        imageScrollView.smoothScrollBy(0, autoScrollStep);
+                        updateSelectionFromTouch(lastRawY);
+                        handler.postDelayed(this, 16);
                     }
-                });
+                }
+            };
+
+            @Override public boolean isDragging() { return isDragSelecting; }
+
+            @Override
+            public void onStartDrag(int startIndex, View view) {
+                isDragSelecting = true;
+                dragStartIndex = startIndex;
+                view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+                imageScrollView.requestDisallowInterceptTouchEvent(true);
+                preDragSelection.clear();
+                for (int i = 0; i < images.size(); i++) {
+                    if (selectedImages.contains(images.get(i))) preDragSelection.add(i);
+                }
+                isSelectMode = !preDragSelection.contains(startIndex);
+                applyRange(startIndex, startIndex);
+            }
+
+            @Override
+            public void onTouchMove(int rawY) {
+                if (!isDragSelecting) return;
+                lastRawY = rawY;
+                updateSelectionFromTouch(rawY);
+                int[] scrollLoc = new int[2];
+                imageScrollView.getLocationOnScreen(scrollLoc);
+                int sTop = scrollLoc[1];
+                int sBottom = sTop + imageScrollView.getHeight();
+                int edge = dp(activity, 48);
+                if (rawY < sTop + edge) {
+                    autoScrollStep = -dp(activity, 14);
+                    handler.removeCallbacks(autoScrollRunnable);
+                    handler.post(autoScrollRunnable);
+                } else if (rawY > sBottom - edge) {
+                    autoScrollStep = dp(activity, 14);
+                    handler.removeCallbacks(autoScrollRunnable);
+                    handler.post(autoScrollRunnable);
+                } else {
+                    autoScrollStep = 0;
+                    handler.removeCallbacks(autoScrollRunnable);
+                }
+            }
+
+            void updateSelectionFromTouch(int rawY) {
+                int hoverIndex = -1;
+                for (int i = 0; i < imageRowViews.size(); i++) {
+                    View child = imageRowViews.get(i);
+                    int[] loc = new int[2];
+                    child.getLocationOnScreen(loc);
+                    if (rawY >= loc[1] && rawY <= loc[1] + child.getHeight()) {
+                        hoverIndex = i;
+                        break;
+                    }
+                }
+                if (hoverIndex < 0 && !imageRowViews.isEmpty()) {
+                    int[] firstLoc = new int[2];
+                    imageRowViews.get(0).getLocationOnScreen(firstLoc);
+                    hoverIndex = (rawY < firstLoc[1]) ? 0 : (imageRowViews.size() - 1);
+                }
+                if (hoverIndex >= 0) applyRange(dragStartIndex, hoverIndex);
+            }
+
+            void applyRange(int start, int end) {
+                int min = Math.min(start, end);
+                int max = Math.max(start, end);
+                for (int i = 0; i < images.size(); i++) {
+                    MediaItem it = images.get(i);
+                    boolean shouldSelect = (i >= min && i <= max) ? isSelectMode : preDragSelection.contains(i);
+                    if (shouldSelect) {
+                        selectedImages.add(it);
+                        if (i < imageCheckBoxes.size()) imageCheckBoxes.get(i).setChecked(true);
+                    } else {
+                        selectedImages.remove(it);
+                        if (i < imageCheckBoxes.size()) imageCheckBoxes.get(i).setChecked(false);
+                    }
+                }
+                onSelectionUpdated();
+            }
+
+            @Override
+            public void onEndDrag() {
+                if (isDragSelecting) {
+                    isDragSelecting = false;
+                    autoScrollStep = 0;
+                    handler.removeCallbacks(autoScrollRunnable);
+                    imageScrollView.requestDisallowInterceptTouchEvent(false);
+                    onSelectionUpdated();
+                }
+            }
+
+            @Override
+            public void onSelectionUpdated() {
+                updateBulkButtonState.run();
+            }
+        }
+
+        final DragSelectController dragController = new DragSelectController();
+
+        if (images.isEmpty()) {
+            imageList.addView(createEmptyState(activity, "No high-resolution images detected on this page.", subTextColor));
+        } else {
+            for (int i = 0; i < images.size(); i++) {
+                final MediaItem item = images.get(i);
+                final CheckBox cb = new CheckBox(activity);
+                imageCheckBoxes.add(cb);
+                View imgCard = createImageCard(activity, item, i, cb, isDark, cardBgColor, textColor, subTextColor, selectedImages, dragController);
+                imageRowViews.add(imgCard);
                 imageList.addView(imgCard);
             }
         }
 
-        // Tab Switching
         tabVideos.setOnClickListener(v -> {
             setTabActive(activity, tabVideos, true, accentColor, cardBgColor);
             setTabActive(activity, tabImages, false, accentColor, cardBgColor);
@@ -215,35 +714,168 @@ public final class MediaPickerBottomSheet {
             imagesContainer.setVisibility(View.VISIBLE);
         });
 
-        dialog.setContentView(root);
-
+        dialog.setContentView(overlayContainer);
         Window win = dialog.getWindow();
         if (win != null) {
-            win.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            win.setGravity(Gravity.BOTTOM);
+            win.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
             win.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-            win.setDimAmount(0.45f);
+            win.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+            win.setWindowAnimations(0);
         }
 
+        root.setTranslationY(expandedHeight);
+        root.setLayerType(View.LAYER_TYPE_HARDWARE, null);
         dialog.show();
+        scrim.animate().alpha(0.52f).setDuration(260).setInterpolator(M3_DECELERATE).start();
+        root.animate()
+                .translationY(halfOffset)
+                .setDuration(280)
+                .setInterpolator(M3_DECELERATE)
+                .withEndAction(() -> root.setLayerType(View.LAYER_TYPE_NONE, null))
+                .start();
+    }
+
+    private static void launchBulkImageDownload(Activity activity, List<MediaItem> targetImages, boolean convertWebp, Button bulkBtn, boolean isDark) {
+        if (targetImages == null || targetImages.isEmpty()) return;
+        sBulkImagesDownloading = true;
+        bulkBtn.setText("DOWNLOADING IMAGES...");
+        bulkBtn.setEnabled(false);
+        styleButton(bulkBtn, Color.parseColor(isDark ? "#4A2800" : "#FFE0B2"), Color.parseColor(isDark ? "#FFA726" : "#E65100"), dp(activity, 8));
+
+        final Handler mainHandler = new Handler(Looper.getMainLooper());
+        final int total = targetImages.size();
+        final java.util.concurrent.atomic.AtomicInteger completed = new java.util.concurrent.atomic.AtomicInteger(0);
+
+        for (int i = 0; i < total; i++) {
+            final MediaItem im = targetImages.get(i);
+            final int idx = i;
+            PatchPrefs.markMediaDownloaded(activity, im.url, "done");
+
+            String lowerUrl = im.url.toLowerCase(Locale.ROOT);
+            String ext = ".jpg";
+            String mime = "image/jpeg";
+            if (lowerUrl.contains(".png")) { ext = ".png"; mime = "image/png"; }
+            else if (lowerUrl.contains(".webp")) { ext = convertWebp ? ".png" : ".webp"; mime = convertWebp ? "image/png" : "image/webp"; }
+            else if (lowerUrl.contains(".gif")) { ext = ".gif"; mime = "image/gif"; }
+            else if (lowerUrl.contains(".avif")) { ext = ".avif"; mime = "image/avif"; }
+            else if (lowerUrl.contains(".bmp")) { ext = ".bmp"; mime = "image/bmp"; }
+            else if (lowerUrl.contains(".heic") || lowerUrl.contains(".heif")) { ext = ".heic"; mime = "image/heic"; }
+
+            String clean = getCleanFileName(im.url);
+            if (clean == null || clean.isEmpty() || clean.equalsIgnoreCase("Video") || clean.equalsIgnoreCase("image")) {
+                clean = "image_" + Integer.toHexString(im.url.hashCode()) + ext;
+            } else if (!clean.contains(".")) {
+                clean = clean + ext;
+            }
+            final String finalFilename = clean;
+            final String finalMime = mime;
+
+            // Stagger native DownloadManager triggers by 150ms so Chromium enqueues every single image cleanly
+            mainHandler.postDelayed(() -> {
+                String relayUrl = LocalDownloadRelay.startRelay(im, finalFilename, finalMime, convertWebp, () -> {
+                    if (completed.incrementAndGet() >= total) {
+                        sBulkImagesDownloading = false;
+                        mainHandler.post(() -> {
+                            bulkBtn.setText("ALL DOWNLOADED ✓ (" + total + " Images)");
+                            bulkBtn.setEnabled(true);
+                            styleButton(bulkBtn, Color.parseColor(isDark ? "#143D1A" : "#D4EDDA"), Color.parseColor(isDark ? "#81C784" : "#155724"), dp(activity, 8));
+                        });
+                    }
+                });
+                String targetUrl = (relayUrl != null) ? relayUrl : im.url;
+                triggerChromiumNativeDownload(targetUrl);
+            }, idx * 150L);
+        }
+
+        Toast.makeText(activity, "Downloading " + total + " image(s) in Brave Downloads", Toast.LENGTH_SHORT).show();
+    }
+
+    /**
+     * Triggers Brave's OWN C++ content::DownloadManager::DownloadUrl via J.N.VOO(0x13, url, webContents).
+     * This is the EXACT native path Brave uses when downloading files — downloads appear immediately
+     * in Brave's Downloads section (chrome-native://downloads/) with live progress, pause/resume,
+     * and native Brave download notifications!
+     */
+    public static boolean triggerChromiumNativeDownload(final String url) {
+        if (url == null || url.isEmpty()) return false;
+        try {
+            Tab activeTab = ActiveTabTracker.getActiveTab();
+            if (activeTab == null) return false;
+            WebContents wc = activeTab.getWebContents();
+            if (wc == null) return false;
+
+            if (!sNativeDownloadLookupDone) {
+                synchronized (MediaPickerBottomSheet.class) {
+                    if (!sNativeDownloadLookupDone) {
+                        try {
+                            Class<?> jnClass = Class.forName("J.N");
+                            sNativeDownloadUrlMethod = jnClass.getMethod("VOO", int.class, Object.class, Object.class);
+                        } catch (Throwable t) {
+                            Log.w(TAG, "Could not resolve J.N.VOO", t);
+                        }
+                        sNativeDownloadLookupDone = true;
+                    }
+                }
+            }
+
+            if (sNativeDownloadUrlMethod != null) {
+                if (Looper.myLooper() == Looper.getMainLooper()) {
+                    sNativeDownloadUrlMethod.invoke(null, 0x13, url, wc);
+                } else {
+                    new Handler(Looper.getMainLooper()).post(() -> {
+                        try {
+                            sNativeDownloadUrlMethod.invoke(null, 0x13, url, wc);
+                        } catch (Throwable t) {
+                            Log.w(TAG, "Deferred J.N.VOO(0x13) failed", t);
+                        }
+                    });
+                }
+                Log.i(TAG, "Triggered native Chromium DownloadManager (J.N.VOO 0x13) for: " + url);
+                return true;
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "triggerChromiumNativeDownload failed for " + url, t);
+        }
+        return false;
+    }
+
+    public interface DragSelectListener {
+        void onStartDrag(int index, View v);
+        void onTouchMove(int rawY);
+        void onEndDrag();
+        boolean isDragging();
+        void onSelectionUpdated();
+    }
+
+    private static String getCleanFileName(String url) {
+        if (url == null || url.isEmpty()) return "Video";
+        try {
+            Uri u = Uri.parse(url);
+            String path = u.getLastPathSegment();
+            if (path != null && !path.isEmpty()) {
+                int q = path.indexOf('?');
+                if (q != -1) path = path.substring(0, q);
+                return path;
+            }
+        } catch (Throwable ignored) {}
+        return "Video";
     }
 
     private static View createVideoCard(
             final Activity activity,
             final MediaItem item,
+            final int index,
+            final int totalVideos,
             boolean isDark,
             int cardBg,
             int textColor,
             int subTextColor,
-            int accentColor,
-            final Dialog dialog
+            int accentColor
     ) {
         LinearLayout card = new LinearLayout(activity);
         card.setOrientation(LinearLayout.VERTICAL);
         LinearLayout.LayoutParams cardLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-        );
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         cardLp.bottomMargin = dp(activity, 10);
         card.setLayoutParams(cardLp);
         card.setPadding(dp(activity, 14), dp(activity, 12), dp(activity, 14), dp(activity, 12));
@@ -253,60 +885,102 @@ public final class MediaPickerBottomSheet {
         bg.setCornerRadius(dp(activity, 12));
         card.setBackground(bg);
 
-        // Row 1: Title & Type badge
-        LinearLayout header = new LinearLayout(activity);
-        header.setOrientation(LinearLayout.HORIZONTAL);
-        header.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout mainRow = new LinearLayout(activity);
+        mainRow.setOrientation(LinearLayout.HORIZONTAL);
+        mainRow.setGravity(Gravity.CENTER_VERTICAL);
+        mainRow.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout leftCol = new LinearLayout(activity);
+        leftCol.setOrientation(LinearLayout.VERTICAL);
+        leftCol.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
 
         TextView title = new TextView(activity);
-        title.setText(item.title);
+        final String cleanName = getCleanFileName(item.url);
+        final String displayTitle = (item.title != null && !item.title.isEmpty() && !item.title.startsWith("Media_")) ? item.title : cleanName;
+        title.setText(totalVideos > 1 ? ("Video " + (index + 1) + ": " + displayTitle) : displayTitle);
         title.setTextColor(textColor);
         title.setTextSize(14);
         title.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
         title.setSingleLine(true);
         title.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        LinearLayout.LayoutParams titleLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f);
-        header.addView(title, titleLp);
+        leftCol.addView(title);
 
-        TextView badge = new TextView(activity);
+        LinearLayout badgesRow = new LinearLayout(activity);
+        badgesRow.setOrientation(LinearLayout.HORIZONTAL);
+        badgesRow.setGravity(Gravity.CENTER_VERTICAL);
+        badgesRow.setPadding(0, dp(activity, 4), 0, dp(activity, 4));
+
+        TextView typeBadge = new TextView(activity);
         String label = "VIDEO";
         if (item.type == MediaType.HLS_STREAM) label = "HLS STREAM";
         else if (item.type == MediaType.DASH_STREAM) label = "DASH STREAM";
         else if (item.type == MediaType.AUDIO) label = "AUDIO";
+        if (totalVideos > 1) label = label + " " + (index + 1) + " of " + totalVideos;
+        typeBadge.setText(label);
+        typeBadge.setTextSize(10);
+        typeBadge.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        typeBadge.setTextColor(Color.WHITE);
+        typeBadge.setPadding(dp(activity, 6), dp(activity, 2), dp(activity, 6), dp(activity, 2));
+        GradientDrawable typeBadgeBg = new GradientDrawable();
+        typeBadgeBg.setColor(accentColor);
+        typeBadgeBg.setCornerRadius(dp(activity, 4));
+        typeBadge.setBackground(typeBadgeBg);
+        badgesRow.addView(typeBadge);
 
-        badge.setText(label);
-        badge.setTextSize(10);
-        badge.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
-        badge.setTextColor(Color.WHITE);
-        badge.setPadding(dp(activity, 6), dp(activity, 2), dp(activity, 6), dp(activity, 2));
-        GradientDrawable badgeBg = new GradientDrawable();
-        badgeBg.setColor(accentColor);
-        badgeBg.setCornerRadius(dp(activity, 4));
-        badge.setBackground(badgeBg);
-        header.addView(badge);
-        card.addView(header);
+        String qLabel = item.getQualityLabel();
+        if (!qLabel.isEmpty()) {
+            TextView qBadge = new TextView(activity);
+            qBadge.setText(qLabel);
+            qBadge.setTextSize(10);
+            qBadge.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+            qBadge.setTextColor(Color.WHITE);
+            qBadge.setPadding(dp(activity, 6), dp(activity, 2), dp(activity, 6), dp(activity, 2));
+            GradientDrawable qBg = new GradientDrawable();
+            qBg.setColor(Color.parseColor("#0088FF"));
+            qBg.setCornerRadius(dp(activity, 4));
+            qBadge.setBackground(qBg);
+            LinearLayout.LayoutParams qLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            qLp.leftMargin = dp(activity, 6);
+            qBadge.setLayoutParams(qLp);
+            badgesRow.addView(qBadge);
+        }
+        leftCol.addView(badgesRow);
 
-        // Row 2: Sub-info
-        String info = item.url;
-        if (!item.getResolutionString().isEmpty()) {
-            info = item.getResolutionString() + " • " + info;
-        }
-        if (!item.getFormattedSize().isEmpty()) {
-            info = item.getFormattedSize() + " • " + info;
-        }
+        StringBuilder subInfo = new StringBuilder();
+        if (!item.getFormattedSize().isEmpty()) subInfo.append(item.getFormattedSize()).append(" • ");
+        if (!item.getResolutionString().isEmpty()) subInfo.append(item.getResolutionString()).append(" • ");
+        subInfo.append(item.url);
         TextView sub = new TextView(activity);
-        sub.setText(info);
+        sub.setText(subInfo.toString());
         sub.setTextColor(subTextColor);
         sub.setTextSize(11);
         sub.setSingleLine(true);
         sub.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
-        sub.setPadding(0, dp(activity, 4), 0, dp(activity, 8));
-        card.addView(sub);
+        sub.setPadding(0, 0, 0, dp(activity, 4));
+        leftCol.addView(sub);
 
-        // Row 3: Action Buttons
+        mainRow.addView(leftCol);
+
+        ImageView thumbView = new ImageView(activity);
+        LinearLayout.LayoutParams thumbLp = new LinearLayout.LayoutParams(dp(activity, 80), dp(activity, 54));
+        thumbLp.leftMargin = dp(activity, 10);
+        thumbView.setLayoutParams(thumbLp);
+        thumbView.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        GradientDrawable thumbBg = new GradientDrawable();
+        thumbBg.setColor(Color.parseColor(isDark ? "#222226" : "#E5E5E8"));
+        thumbBg.setCornerRadius(dp(activity, 6));
+        thumbView.setBackground(thumbBg);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) thumbView.setClipToOutline(true);
+        ThumbnailLoader.load(thumbView, item.thumbnailUrl, item.referer);
+        mainRow.addView(thumbView);
+        card.addView(mainRow);
+
         LinearLayout actions = new LinearLayout(activity);
         actions.setOrientation(LinearLayout.HORIZONTAL);
         actions.setGravity(Gravity.END);
+        actions.setPadding(0, dp(activity, 6), 0, 0);
 
         Button copyBtn = new Button(activity);
         copyBtn.setText("Copy Link");
@@ -320,27 +994,161 @@ public final class MediaPickerBottomSheet {
         });
         actions.addView(copyBtn);
 
-        Button dlBtn = new Button(activity);
-        dlBtn.setText("Download");
-        styleButton(dlBtn, accentColor, Color.WHITE, dp(activity, 6));
+        final Button dlBtn = new Button(activity);
+        if (ACTIVE_DOWNLOAD_URLS.contains(item.url)) {
+            dlBtn.setText("DOWNLOADING...");
+            dlBtn.setEnabled(false);
+            styleButton(dlBtn, Color.parseColor(isDark ? "#4A2800" : "#FFE0B2"), Color.parseColor(isDark ? "#FFA726" : "#E65100"), dp(activity, 6));
+        } else if (PatchPrefs.isMediaDownloaded(activity, item.url)) {
+            dlBtn.setText("DOWNLOADED ✓");
+            styleButton(dlBtn, Color.parseColor(isDark ? "#143D1A" : "#D4EDDA"), Color.parseColor(isDark ? "#81C784" : "#155724"), dp(activity, 6));
+        } else {
+            dlBtn.setText("Download");
+            styleButton(dlBtn, accentColor, Color.WHITE, dp(activity, 6));
+        }
+
         dlBtn.setOnClickListener(v -> {
-            if (item.type == MediaType.HLS_STREAM && item.variants.size() > 1) {
-                showQualitySelectorAndDownload(activity, item, dialog);
+            if (PatchPrefs.isMediaDownloaded(activity, item.url)) {
+                new AlertDialog.Builder(activity)
+                        .setTitle("File Already Downloaded")
+                        .setMessage("'" + displayTitle + "' has already been downloaded.\n\nDo you want to download it again?")
+                        .setPositiveButton("Download Again", (d, which) -> triggerDownload(activity, item, dlBtn, isDark))
+                        .setNegativeButton("Cancel", null)
+                        .show();
             } else {
-                startMediaDownload(activity, item);
-                dialog.dismiss();
+                triggerDownload(activity, item, dlBtn, isDark);
             }
         });
         actions.addView(dlBtn);
-
         card.addView(actions);
         return card;
     }
 
-    private static void showQualitySelectorAndDownload(final Activity activity, final MediaItem item, final Dialog parentDialog) {
+    private static void triggerDownload(final Activity activity, final MediaItem item, final Button dlBtn, final boolean isDark) {
+        ACTIVE_DOWNLOAD_URLS.add(item.url);
+        dlBtn.setText("DOWNLOADING...");
+        dlBtn.setEnabled(false);
+        styleButton(dlBtn, Color.parseColor(isDark ? "#4A2800" : "#FFE0B2"), Color.parseColor(isDark ? "#FFA726" : "#E65100"), dp(activity, 6));
+
+        if (item.type == MediaType.HLS_STREAM && item.variants.size() > 1) {
+            showQualitySelectorAndDownload(activity, item, dlBtn, isDark);
+        } else if (item.type == MediaType.HLS_STREAM) {
+            startMediaDownload(activity, item);
+            PatchPrefs.markMediaDownloaded(activity, item.url, "done");
+        } else {
+            startDirectDownloadNative(activity, item, dlBtn, isDark);
+        }
+    }
+
+    private static void startDirectDownloadNative(final Activity activity, final MediaItem item, final Button dlBtn, final boolean isDark) {
+        String ext = item.type == MediaType.AUDIO ? ".mp3" : ".mp4";
+        String defaultMime = item.type == MediaType.AUDIO ? "audio/mpeg" : "video/mp4";
+        String lowerUrl = item.url.toLowerCase(Locale.ROOT);
+        if (lowerUrl.contains(".webm")) { ext = ".webm"; defaultMime = "video/webm"; }
+        else if (lowerUrl.contains(".mkv")) { ext = ".mkv"; defaultMime = "video/x-matroska"; }
+        else if (lowerUrl.contains(".mov")) { ext = ".mov"; defaultMime = "video/quicktime"; }
+        else if (lowerUrl.contains(".avi")) { ext = ".avi"; defaultMime = "video/x-msvideo"; }
+        else if (lowerUrl.contains(".flv") || lowerUrl.contains(".f4v")) { ext = ".flv"; defaultMime = "video/x-flv"; }
+        else if (lowerUrl.contains(".3gp")) { ext = ".3gp"; defaultMime = "video/3gpp"; }
+        else if (lowerUrl.contains(".ogv")) { ext = ".ogv"; defaultMime = "video/ogg"; }
+        else if (lowerUrl.contains(".gif")) { ext = ".gif"; defaultMime = "image/gif"; }
+        else if (lowerUrl.contains(".m4a")) { ext = ".m4a"; defaultMime = "audio/mp4"; }
+        else if (lowerUrl.contains(".aac")) { ext = ".aac"; defaultMime = "audio/aac"; }
+        else if (lowerUrl.contains(".ogg") || lowerUrl.contains(".opus")) { ext = ".ogg"; defaultMime = "audio/ogg"; }
+        else if (lowerUrl.contains(".flac")) { ext = ".flac"; defaultMime = "audio/flac"; }
+        else if (lowerUrl.contains(".wav")) { ext = ".wav"; defaultMime = "audio/wav"; }
+        final String resolvedMime = (item.mimeType != null && !item.mimeType.isEmpty()) ? item.mimeType : defaultMime;
+        String clean = getCleanFileName(item.url);
+        String lowerClean = clean.toLowerCase(Locale.ROOT);
+        if (lowerClean.equals("videoplayback") || lowerClean.equals("video") || lowerClean.equals("media")
+                || lowerClean.equals("index") || lowerClean.equals("master") || lowerClean.equals("playlist")) {
+            String titleBase = (item.title != null && !item.title.trim().isEmpty())
+                    ? item.title.trim().replaceAll("[^a-zA-Z0-9._-]", "_")
+                    : "video";
+            if (titleBase.length() > 40) titleBase = titleBase.substring(0, 40);
+            String shortHash = Integer.toHexString(item.url.hashCode());
+            clean = titleBase + "_" + shortHash + ext;
+        }
+        final String filename = clean.contains(".") ? clean : (clean + ext);
+
+        // 0. Adaptive HD YouTube Video + Audio mux path (downloads video+audio, muxes via MediaMuxer, serves to Brave Downloads!)
+        if (item.audioUrl != null && !item.audioUrl.isEmpty()) {
+            Toast.makeText(activity, "Preparing HD video + audio: " + filename, Toast.LENGTH_SHORT).show();
+            LocalDownloadRelay.startMuxedDownload(
+                    activity.getCacheDir(),
+                    item,
+                    filename,
+                    null,
+                    muxRelayUrl -> {
+                        if (triggerChromiumNativeDownload(muxRelayUrl)) {
+                            PatchPrefs.markMediaDownloaded(activity, item.url, filename);
+                        }
+                    },
+                    () -> {
+                        ACTIVE_DOWNLOAD_URLS.remove(item.url);
+                        new Handler(Looper.getMainLooper()).post(() -> {
+                            dlBtn.setText("DOWNLOADED ✓");
+                            dlBtn.setEnabled(true);
+                            styleButton(dlBtn, Color.parseColor(isDark ? "#143D1A" : "#D4EDDA"), Color.parseColor(isDark ? "#81C784" : "#155724"), dp(activity, 6));
+                        });
+                    }
+            );
+            return;
+        }
+
+        // 1. Primary path: Stream via 1-shot LocalDownloadRelay (injects exact Referer/Cookie/UA)
+        // straight into Brave's native C++ content::DownloadManager (J.N.VOO 0x13)!
+        // Appears IMMEDIATELY in Brave's Downloads section with live progress & ZERO 403 errors.
+        String relayUrl = LocalDownloadRelay.startRelay(item, filename, resolvedMime, () -> {
+            ACTIVE_DOWNLOAD_URLS.remove(item.url);
+            new Handler(Looper.getMainLooper()).post(() -> {
+                dlBtn.setText("DOWNLOADED ✓");
+                dlBtn.setEnabled(true);
+                styleButton(dlBtn, Color.parseColor(isDark ? "#143D1A" : "#D4EDDA"), Color.parseColor(isDark ? "#81C784" : "#155724"), dp(activity, 6));
+            });
+        });
+
+        String targetUrl = (relayUrl != null) ? relayUrl : item.url;
+        if (triggerChromiumNativeDownload(targetUrl)) {
+            PatchPrefs.markMediaDownloaded(activity, item.url, filename);
+            Toast.makeText(activity, "Downloading in Brave Downloads: " + filename, Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        // 2. Fallback: Android system DownloadManager
+        try {
+            DownloadManager dm = (DownloadManager) activity.getSystemService(Context.DOWNLOAD_SERVICE);
+            if (dm != null) {
+                DownloadManager.Request req = new DownloadManager.Request(Uri.parse(item.url));
+                req.setTitle(item.title != null && !item.title.isEmpty() ? item.title : filename);
+                req.setDescription("Downloading " + filename);
+                req.setMimeType(resolvedMime);
+                if (item.userAgent != null && !item.userAgent.isEmpty()) req.addRequestHeader("User-Agent", item.userAgent);
+                if (item.cookie != null && !item.cookie.isEmpty()) req.addRequestHeader("Cookie", item.cookie);
+                if (item.referer != null && !item.referer.isEmpty()) req.addRequestHeader("Referer", item.referer);
+                req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+                req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, filename);
+                dm.enqueue(req);
+                PatchPrefs.markMediaDownloaded(activity, item.url, filename);
+                Toast.makeText(activity, "Download started: " + filename, Toast.LENGTH_SHORT).show();
+            }
+        } catch (Throwable t) {
+            ACTIVE_DOWNLOAD_URLS.remove(item.url);
+            Toast.makeText(activity, "Download failed: " + t.getMessage(), Toast.LENGTH_LONG).show();
+            dlBtn.setText("Download");
+            dlBtn.setEnabled(true);
+            styleButton(dlBtn, Color.parseColor("#FF5500"), Color.WHITE, dp(activity, 6));
+        }
+    }
+
+    private static void showQualitySelectorAndDownload(
+            final Activity activity,
+            final MediaItem item,
+            final Button dlBtn,
+            final boolean isDark
+    ) {
         final List<MediaItem.HlsVariant> variants = new ArrayList<>(item.variants);
         Collections.sort(variants);
-
         String[] labels = new String[variants.size()];
         for (int i = 0; i < variants.size(); i++) {
             MediaItem.HlsVariant v = variants.get(i);
@@ -358,28 +1166,34 @@ public final class MediaPickerBottomSheet {
                             item.durationMs, item.userAgent, item.cookie, item.referer, item.tabId
                     );
                     startMediaDownload(activity, chosenItem);
-                    parentDialog.dismiss();
+                    PatchPrefs.markMediaDownloaded(activity, item.url, "done");
                 })
-                .setNegativeButton("Cancel", null)
+                .setNegativeButton("Cancel", (d, which) -> {
+                    ACTIVE_DOWNLOAD_URLS.remove(item.url);
+                    dlBtn.setText("Download");
+                    dlBtn.setEnabled(true);
+                    styleButton(dlBtn, Color.parseColor("#FF5500"), Color.WHITE, dp(activity, 6));
+                })
                 .show();
     }
 
     private static View createImageCard(
             final Activity activity,
             final MediaItem item,
+            final int index,
+            final CheckBox cb,
+            boolean isDark,
             int cardBg,
             int textColor,
             int subTextColor,
             final Set<MediaItem> selected,
-            final Runnable onSelectionChanged
+            final DragSelectListener dragListener
     ) {
-        LinearLayout row = new LinearLayout(activity);
+        final LinearLayout row = new LinearLayout(activity);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
         LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-        );
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         rowLp.bottomMargin = dp(activity, 8);
         row.setLayoutParams(rowLp);
         row.setPadding(dp(activity, 10), dp(activity, 8), dp(activity, 10), dp(activity, 8));
@@ -389,22 +1203,21 @@ public final class MediaPickerBottomSheet {
         bg.setCornerRadius(dp(activity, 8));
         row.setBackground(bg);
 
-        CheckBox cb = new CheckBox(activity);
-        cb.setOnCheckedChangeListener((btn, isChecked) -> {
-            if (isChecked) selected.add(item);
+        cb.setOnClickListener(v -> {
+            if (cb.isChecked()) selected.add(item);
             else selected.remove(item);
-            onSelectionChanged.run();
+            if (dragListener != null) dragListener.onSelectionUpdated();
         });
         row.addView(cb);
 
         LinearLayout textCol = new LinearLayout(activity);
         textCol.setOrientation(LinearLayout.VERTICAL);
-        LinearLayout.LayoutParams textLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f);
-        textCol.setLayoutParams(textLp);
+        textCol.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
 
         TextView title = new TextView(activity);
-        title.setText(item.title);
-        title.setTextColor(textColor);
+        boolean downloaded = PatchPrefs.isMediaDownloaded(activity, item.url);
+        title.setText(downloaded ? ("✓ " + item.title) : item.title);
+        title.setTextColor(downloaded ? Color.parseColor(isDark ? "#81C784" : "#155724") : textColor);
         title.setTextSize(13);
         title.setSingleLine(true);
         title.setEllipsize(android.text.TextUtils.TruncateAt.END);
@@ -418,8 +1231,54 @@ public final class MediaPickerBottomSheet {
         sub.setSingleLine(true);
         sub.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
         textCol.addView(sub);
-
         row.addView(textCol);
+
+        ImageView imgThumb = new ImageView(activity);
+        LinearLayout.LayoutParams imgThumbLp = new LinearLayout.LayoutParams(dp(activity, 54), dp(activity, 54));
+        imgThumbLp.leftMargin = dp(activity, 10);
+        imgThumb.setLayoutParams(imgThumbLp);
+        imgThumb.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        GradientDrawable itBg = new GradientDrawable();
+        itBg.setColor(Color.parseColor("#222226"));
+        itBg.setCornerRadius(dp(activity, 6));
+        imgThumb.setBackground(itBg);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) imgThumb.setClipToOutline(true);
+        ThumbnailLoader.load(imgThumb, item.url, item.referer);
+        row.addView(imgThumb);
+
+        View.OnLongClickListener longClick = v -> {
+            if (dragListener != null) {
+                dragListener.onStartDrag(index, row);
+                return true;
+            }
+            return false;
+        };
+        row.setOnLongClickListener(longClick);
+        cb.setOnLongClickListener(longClick);
+
+        View.OnTouchListener touchListener = (v, event) -> {
+            if (dragListener != null) {
+                int action = event.getActionMasked();
+                if (action == MotionEvent.ACTION_MOVE && dragListener.isDragging()) {
+                    dragListener.onTouchMove((int) event.getRawY());
+                    return true;
+                } else if ((action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) && dragListener.isDragging()) {
+                    dragListener.onEndDrag();
+                    return true;
+                }
+            }
+            return false;
+        };
+        row.setOnTouchListener(touchListener);
+        cb.setOnTouchListener(touchListener);
+
+        row.setOnClickListener(v -> {
+            cb.setChecked(!cb.isChecked());
+            if (cb.isChecked()) selected.add(item);
+            else selected.remove(item);
+            if (dragListener != null) dragListener.onSelectionUpdated();
+        });
+
         return row;
     }
 
@@ -427,18 +1286,14 @@ public final class MediaPickerBottomSheet {
         try {
             String jobId = UUID.randomUUID().toString();
             MediaDownloadService.PENDING_JOBS.put(jobId, item);
-
             Intent intent = new Intent(ctx, MediaDownloadService.class);
             intent.setAction(MediaDownloadService.ACTION_DOWNLOAD_MEDIA);
             intent.putExtra(MediaDownloadService.EXTRA_JOB_ID, jobId);
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                ctx.startForegroundService(intent);
-            } else {
-                ctx.startService(intent);
-            }
-            Toast.makeText(ctx, "Starting background download...", Toast.LENGTH_SHORT).show();
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(intent);
+            else ctx.startService(intent);
+            Toast.makeText(ctx, "Starting HLS download...", Toast.LENGTH_SHORT).show();
         } catch (Throwable t) {
+            ACTIVE_DOWNLOAD_URLS.remove(item.url);
             Toast.makeText(ctx, "Failed starting download service: " + t.getMessage(), Toast.LENGTH_LONG).show();
         }
     }
@@ -447,19 +1302,15 @@ public final class MediaPickerBottomSheet {
         try {
             String jobId = UUID.randomUUID().toString();
             MediaDownloadService.PENDING_JOBS.put(jobId, new ArrayList<>(images));
-
             Intent intent = new Intent(ctx, MediaDownloadService.class);
             intent.setAction(MediaDownloadService.ACTION_DOWNLOAD_IMAGES);
             intent.putExtra(MediaDownloadService.EXTRA_JOB_ID, jobId);
             intent.putExtra(MediaDownloadService.EXTRA_CONVERT_WEBP, convertWebp);
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                ctx.startForegroundService(intent);
-            } else {
-                ctx.startService(intent);
-            }
-            Toast.makeText(ctx, "Starting bulk image download...", Toast.LENGTH_SHORT).show();
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(intent);
+            else ctx.startService(intent);
+            Toast.makeText(ctx, "Downloading " + images.size() + " images...", Toast.LENGTH_SHORT).show();
         } catch (Throwable t) {
+            sBulkImagesDownloading = false;
             Toast.makeText(ctx, "Failed starting image download: " + t.getMessage(), Toast.LENGTH_LONG).show();
         }
     }

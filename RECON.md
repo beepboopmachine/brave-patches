@@ -210,11 +210,11 @@ Audit of `AndroidManifest.xml` indicates:
 ```xml
 <!-- Injected under <application> -->
 <service
-    android:name="com.brave.media.downloader.MediaDownloadService"
+    android:name="dev.brave.extension.media.MediaDownloadService"
     android:exported="false"
     android:foregroundServiceType="dataSync" />
 ```
-*No new `<uses-permission>` tags are required.*
+*Note: Canonical extension package is `dev.brave.extension.*`.*
 
 ---
 

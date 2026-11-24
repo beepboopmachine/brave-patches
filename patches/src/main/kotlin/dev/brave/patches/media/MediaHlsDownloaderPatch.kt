@@ -7,6 +7,7 @@ import app.morphe.patcher.patch.resourceXml
 import com.android.tools.smali.dexlib2.Opcode
 import com.android.tools.smali.dexlib2.iface.instruction.OneRegisterInstruction
 import com.android.tools.smali.dexlib2.iface.instruction.ReferenceInstruction
+import com.android.tools.smali.dexlib2.iface.reference.FieldReference
 import com.android.tools.smali.dexlib2.iface.reference.MethodReference
 import dev.brave.patches.core.braveCorePatch
 import dev.brave.patches.shared.COMPATIBILITY_BRAVE
@@ -25,7 +26,7 @@ val mediaHlsDownloaderPatch = patch(
     extendWith("extensions/brave.mpe")
 
     execute {
-        // 1. Android 14+ Security: Ensure required foreground service permissions and service are in AndroidManifest.xml
+        // 1. Android 14+ Security & Legacy Storage: Ensure required permissions and service are in AndroidManifest.xml
         resourceXml("AndroidManifest.xml").use { xml ->
             val existingPerms = xml.elements("uses-permission")
                 .mapNotNull { it.attribute("android:name") }
@@ -41,11 +42,22 @@ val mediaHlsDownloaderPatch = patch(
                     setAttribute("android:name", "android.permission.FOREGROUND_SERVICE_DATA_SYNC")
                 }
             }
+            if ("android.permission.POST_NOTIFICATIONS" !in existingPerms) {
+                xml.root.appendChild("uses-permission") {
+                    setAttribute("android:name", "android.permission.POST_NOTIFICATIONS")
+                }
+            }
+            if ("android.permission.WRITE_EXTERNAL_STORAGE" !in existingPerms) {
+                xml.root.appendChild("uses-permission") {
+                    setAttribute("android:name", "android.permission.WRITE_EXTERNAL_STORAGE")
+                    setAttribute("android:maxSdkVersion", "28")
+                }
+            }
 
             val application = xml.elements("application").firstOrNull()
                 ?: throw IllegalStateException("No <application> element found in AndroidManifest.xml")
 
-            val serviceExists = xml.elements("service").any {
+            val serviceExists = application.elements("service").any {
                 it.attribute("android:name") == "dev.brave.extension.media.MediaDownloadService"
             }
             if (!serviceExists) {
@@ -94,6 +106,40 @@ val mediaHlsDownloaderPatch = patch(
             addInstructions(
                 0,
                 "invoke-static/range {p1 .. p1}, $TOOLBAR_HOOK->onUrlFocusChanged(Z)V"
+            )
+        }
+
+        // 5. Hook ToolbarPhone.dispatchDraw(Canvas)V during GPU texture snapshot capture
+        // so our custom download button is drawn into the composited toolbar bitmap and
+        // scrolls in/out at 120fps in exact lockstep with native toolbar buttons (zero pop-in).
+        ToolbarPhoneDispatchDrawFingerprint.method.apply {
+            val tabStackFieldIdx = instructions.indices.indexOfFirst { idx ->
+                val inst = instructions[idx]
+                if (inst.opcode != Opcode.IGET_OBJECT) return@indexOfFirst false
+                val ref = (inst as? ReferenceInstruction)?.reference as? FieldReference ?: return@indexOfFirst false
+                ref.type == "Lorg/chromium/chrome/browser/toolbar/top/ToggleTabStackButton;"
+            }
+            if (tabStackFieldIdx < 0) {
+                throw IllegalStateException("Could not find ToggleTabStackButton iget-object in ToolbarPhone.dispatchDraw")
+            }
+            // Walk back to the parent IGET_OBJECT (Lcr2;->F:Ldmk;) immediately preceding the ToggleTabStackButton check
+            var dmkIdx = -1
+            for (i in tabStackFieldIdx - 1 downTo 0) {
+                val inst = instructions[i]
+                if (inst.opcode == Opcode.IGET_OBJECT) {
+                    val ref = (inst as? ReferenceInstruction)?.reference as? FieldReference
+                    if (ref != null && ref.definingClass == "Lcr2;") {
+                        dmkIdx = i
+                        break
+                    }
+                }
+            }
+            if (dmkIdx < 0) {
+                throw IllegalStateException("Could not find Lcr2;->F iget-object in ToolbarPhone.dispatchDraw")
+            }
+            addInstructions(
+                dmkIdx + 1,
+                "invoke-static/range {p0 .. p1}, $TOOLBAR_HOOK->drawCustomButtonForSnapshot(Landroid/view/ViewGroup;Landroid/graphics/Canvas;)V"
             )
         }
     }

@@ -80,4 +80,29 @@ public final class PatchPrefs {
             }
         } catch (Throwable ignored) {}
     }
+
+    private static final String PREF_DOWNLOADED_PREFIX = "downloaded_media_";
+
+    public static boolean isMediaDownloaded(Context context, String url) {
+        if (url == null || url.isEmpty()) return false;
+        try {
+            String path = getString(context, PREF_DOWNLOADED_PREFIX + url.hashCode(), null);
+            if (path != null && !path.isEmpty()) {
+                if ("done".equals(path)) return true;
+                java.io.File f = new java.io.File(path);
+                if (f.exists() && f.length() > 0) return true;
+                java.io.File fDl = new java.io.File(android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS), path);
+                if (fDl.exists() && fDl.length() > 0) return true;
+                return true;
+            }
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
+    public static void markMediaDownloaded(Context context, String url, String filePath) {
+        if (url == null || url.isEmpty()) return;
+        try {
+            setString(context, PREF_DOWNLOADED_PREFIX + url.hashCode(), filePath != null && !filePath.isEmpty() ? filePath : "done");
+        } catch (Throwable ignored) {}
+    }
 }

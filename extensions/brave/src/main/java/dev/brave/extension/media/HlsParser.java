@@ -38,7 +38,8 @@ public final class HlsParser {
         }
 
         public boolean isDrm() {
-            return "SAMPLE-AES".equalsIgnoreCase(method) || "SAMPLE-AES-CTR".equalsIgnoreCase(method);
+            return "SAMPLE-AES".equalsIgnoreCase(method) || "SAMPLE-AES-CTR".equalsIgnoreCase(method)
+                    || (uri != null && uri.contains("urn:uuid:"));
         }
     }
 

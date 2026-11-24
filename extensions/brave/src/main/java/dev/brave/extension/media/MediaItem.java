@@ -58,6 +58,9 @@ public class MediaItem implements Serializable {
     public final String referer;
     public final int tabId;
     public final long timestamp;
+    public volatile String thumbnailUrl;
+    public volatile String qualityLabel;
+    public volatile String audioUrl = "";
     public final List<HlsVariant> variants = new ArrayList<>();
 
     public MediaItem(
@@ -75,6 +78,26 @@ public class MediaItem implements Serializable {
             String referer,
             int tabId
     ) {
+        this(id, type, url, title, mimeType, sizeBytes, width, height, durationMs, userAgent, cookie, referer, tabId, "", "");
+    }
+
+    public MediaItem(
+            String id,
+            MediaType type,
+            String url,
+            String title,
+            String mimeType,
+            long sizeBytes,
+            int width,
+            int height,
+            long durationMs,
+            String userAgent,
+            String cookie,
+            String referer,
+            int tabId,
+            String thumbnailUrl,
+            String qualityLabel
+    ) {
         this.url = url != null ? url : "";
         this.id = id != null ? id : this.url;
         this.type = type != null ? type : MediaType.VIDEO;
@@ -88,10 +111,16 @@ public class MediaItem implements Serializable {
         this.cookie = cookie != null ? cookie : "";
         this.referer = referer != null ? referer : "";
         this.tabId = tabId;
+        this.thumbnailUrl = (thumbnailUrl != null && !thumbnailUrl.trim().isEmpty()) ? thumbnailUrl.trim() : (this.type == MediaType.IMAGE ? this.url : "");
+        this.qualityLabel = qualityLabel != null ? qualityLabel.trim() : "";
         this.timestamp = System.currentTimeMillis();
     }
 
     public synchronized void updateEnrichedMetadata(String title, String mime, int w, int h, long size, long dur) {
+        updateEnrichedMetadata(title, mime, w, h, size, dur, null, null);
+    }
+
+    public synchronized void updateEnrichedMetadata(String title, String mime, int w, int h, long size, long dur, String thumb, String quality) {
         if (title != null && !title.trim().isEmpty() && !title.startsWith("Media_")) {
             this.title = title.trim();
         }
@@ -102,6 +131,50 @@ public class MediaItem implements Serializable {
         if (h > 0) this.height = h;
         if (size > 0) this.sizeBytes = size;
         if (dur > 0) this.durationMs = dur;
+        if (thumb != null && !thumb.trim().isEmpty()) {
+            if (this.thumbnailUrl == null || this.thumbnailUrl.trim().isEmpty()) {
+                this.thumbnailUrl = thumb.trim();
+            }
+        }
+        if (quality != null && !quality.trim().isEmpty()) this.qualityLabel = quality.trim();
+    }
+
+    public String getQualityLabel() {
+        if (qualityLabel != null && !qualityLabel.trim().isEmpty()) {
+            return qualityLabel.trim();
+        }
+        if (height > 0) {
+            if (height >= 2160 || width >= 3840) return "4K";
+            if (height >= 1440 || width >= 2560) return "2K";
+            if (height >= 1080 || width >= 1920) return "1080p";
+            if (height >= 720 || width >= 1280) return "720p";
+            if (height >= 480) return "480p";
+            if (height >= 360) return "360p";
+            if (height >= 240) return "240p";
+            return height + "p";
+        }
+        if (!variants.isEmpty()) {
+            int maxH = 0;
+            for (HlsVariant v : variants) {
+                if (v.height > maxH) maxH = v.height;
+            }
+            if (maxH > 0) {
+                if (variants.size() > 1) {
+                    return "Multi (" + maxH + "p max)";
+                } else {
+                    return maxH + "p";
+                }
+            }
+        }
+        String target = (url + " " + title).toLowerCase(java.util.Locale.ROOT);
+        if (target.contains("2160p") || target.contains("4k")) return "4K";
+        if (target.contains("1440p") || target.contains("2k")) return "2K";
+        if (target.contains("1080p") || target.contains("_1080")) return "1080p";
+        if (target.contains("720p") || target.contains("_720") || target.contains("hd")) return "720p";
+        if (target.contains("480p") || target.contains("_480")) return "480p";
+        if (target.contains("360p") || target.contains("_360")) return "360p";
+        if (target.contains("240p")) return "240p";
+        return "";
     }
 
     public String getFormattedSize() {

@@ -126,12 +126,13 @@ To avoid corrupting plain-text clipboard copies (passwords, code snippets, memos
   - **Platform Trackers**: `igshid`, `si` (YouTube tracking identifier), `mc_eid`, `vero_id`, `_openstat`
 
 ### 5.3 Morphe Fingerprint Blueprint: Share & Copy Stripper
+*(Canonical extension implementation: `dev.brave.extension.tools.UrlStripper`)*
 
 | Target Purpose | Smali Descriptor | Access & Signature | Stable Anchors (Opcodes / Strings / Registers) | Register & Injection Strategy |
 |:---|:---|:---|:---|:---|
-| **Sanitize Clipboard Copies (Guarded)** | `Ld14;` | `public final setText(Ljava/lang/String;)V` | `const-string v0, "text"`<br>`const/4 v1, 0x0`<br>`invoke-virtual {p0, v0, p1, v1}, Ld14;->j(Ljava/lang/String;Ljava/lang/String;Z)V` | Before `invoke-virtual {p0, v0, p1, v1}, Ld14;->j(...)`: Insert `invoke-static {p1}, Lcom/morphe/brave/UrlStripper;->sanitizeUrlIfHttp(Ljava/lang/String;)Ljava/lang/String;` and `move-result-object p1`. |
+| **Sanitize Clipboard Copies (Guarded)** | `Ld14;` | `public final setText(Ljava/lang/String;)V` | `const-string v0, "text"`<br>`const/4 v1, 0x0`<br>`invoke-virtual {p0, v0, p1, v1}, Ld14;->j(Ljava/lang/String;Ljava/lang/String;Z)V` | Before `invoke-virtual {p0, v0, p1, v1}, Ld14;->j(...)`: Insert `invoke-static {p1}, Ldev/brave/extension/tools/UrlStripper;->sanitizeUrlIfHttp(Ljava/lang/String;)Ljava/lang/String;` and `move-result-object p1`. |
 | **Sanitize Share Sheet Dispatch** | `Ljn2;` | `public final d(Lbih;Lzu3;I)V` | `invoke-virtual {p1}, Lbih;->b()Ljava/lang/String;`<br>`invoke-static {v1}, Landroid/text/TextUtils;->isEmpty(Ljava/lang/CharSequence;)Z` | At entry of `jn2->d(Lbih;Lzu3;I)V`, inspect `p1` (`ShareParams`). If `p1.d` (URL string) is non-empty, sanitize via `UrlStripper.sanitizeUrlIfHttp()` before Mojo serialization (`LJ/N;->VOOO(...)`). |
-| **Sanitize Generic Chooser Intent** | `Lcye;` | `public static e(Landroid/content/Context;Ljava/lang/String;)V` | `const-string v1, "android.intent.action.SEND"`<br>`const-string v1, "android.intent.extra.TEXT"`<br>`invoke-virtual {v0, v1, p1}, Landroid/content/Intent;->putExtra(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;` | Before `putExtra`: Insert `invoke-static {p1}, Lcom/morphe/brave/UrlStripper;->sanitizeUrlIfHttp(Ljava/lang/String;)Ljava/lang/String;` and `move-result-object p1`. |
+| **Sanitize Generic Chooser Intent** | `Lcye;` | `public static e(Landroid/content/Context;Ljava/lang/String;)V` | `const-string v1, "android.intent.action.SEND"`<br>`const-string v1, "android.intent.extra.TEXT"`<br>`invoke-virtual {v0, v1, p1}, Landroid/content/Intent;->putExtra(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;` | Before `putExtra`: Insert `invoke-static {p1}, Ldev/brave/extension/tools/UrlStripper;->sanitizeUrlIfHttp(Ljava/lang/String;)Ljava/lang/String;` and `move-result-object p1`. |
 
 ---
 
@@ -147,7 +148,7 @@ Chromium manages HTML5 fullscreen transitions via `v28` (`smali_classes2/v28.sma
 - **Exiting Fullscreen**: Method `v28->c()V` cleans up fullscreen states.
 
 ### 6.2 Robust Video Element Targeting & JS Execution
-- **Production JS Execution**: Do **not** use test-only `evaluateJavaScriptForTests`. Route calls through the verified production JavaScript execution hook established in RECON.md (`p1.getWebContents().evaluateJavaScript(String script, JavaScriptCallback callback)` or `JsInjectionHub`).
+- **Production JS Execution**: Do **not** use test-only `evaluateJavaScriptForTests`. Route calls through `WebContents.M(String)` (or `JsInjectionHub`), which invokes the direct JNI execution path (`WebContentsImpl.M(String script)`) as proven in RECON.md Section 3.1.
 - **Robust Video Selector**:
   ```javascript
   const v = document.fullscreenElement?.tagName === 'VIDEO' ? document.fullscreenElement : (document.fullscreenElement?.querySelector('video') || document.querySelector('video'));
@@ -155,11 +156,12 @@ Chromium manages HTML5 fullscreen transitions via `v28` (`smali_classes2/v28.sma
 - **Touch Pass-Through**: The injected `FullscreenGestureOverlayView` must return `false` on single tap events (`MotionEvent.ACTION_UP` without movement) so that native player controls (play/pause, seekbar dragging, quality settings) remain fully responsive.
 
 ### 6.3 Morphe Fingerprint Blueprint: Fullscreen Video Gestures
+*(Canonical extension implementation: `dev.brave.extension.gestures.VideoGestureOverlay`)*
 
 | Target Purpose | Smali Descriptor | Access & Signature | Stable Anchors (Opcodes / Strings / Registers) | Register & Injection Strategy |
 |:---|:---|:---|:---|:---|
-| **Hook Fullscreen Enter** | `Lv28;` | `public final h(Lorg/chromium/chrome/browser/tab/Tab;Lorg/chromium/chrome/browser/fullscreen/FullscreenOptions;)V` | `invoke-interface {p1}, Lorg/chromium/chrome/browser/tab/Tab;->getWebContents()Lorg/chromium/content_public/browser/WebContents;`<br>`const-string v0, "FullscreenHtmlApiHandler.enterFullScreen"` | At end of `h()`, inject: `iget-object v0, p0, Lv28;->v:Landroid/app/Activity;`<br>`invoke-static {v0, p1}, Lcom/morphe/brave/VideoGestureOverlay;->attach(Landroid/app/Activity;Lorg/chromium/chrome/browser/tab/Tab;)V`. |
-| **Hook Fullscreen Exit** | `Lv28;` | `public c()V` | `const-string v0, "FullscreenHtmlApiHandler.exitFullScreen"`<br>`invoke-static {v0, v1}, Ly0m;->j(Ljava/lang/Object;Ljava/lang/String;)V` | At entry of `c()`, inject: `iget-object v0, p0, Lv28;->v:Landroid/app/Activity;`<br>`invoke-static {v0}, Lcom/morphe/brave/VideoGestureOverlay;->detach(Landroid/app/Activity;)V`. |
+| **Hook Fullscreen Enter** | `Lv28;` | `public final h(Lorg/chromium/chrome/browser/tab/Tab;Lorg/chromium/chrome/browser/fullscreen/FullscreenOptions;)V` | `invoke-interface {p1}, Lorg/chromium/chrome/browser/tab/Tab;->getWebContents()Lorg/chromium/content_public/browser/WebContents;`<br>`const-string v0, "FullscreenHtmlApiHandler.enterFullScreen"` | At end of `h()`, inject: `iget-object v0, p0, Lv28;->v:Landroid/app/Activity;`<br>`invoke-static {v0, p1}, Ldev/brave/extension/gestures/VideoGestureOverlay;->attach(Landroid/app/Activity;Lorg/chromium/chrome/browser/tab/Tab;)V`. |
+| **Hook Fullscreen Exit** | `Lv28;` | `public c()V` | `const-string v0, "FullscreenHtmlApiHandler.exitFullScreen"`<br>`invoke-static {v0, v1}, Ly0m;->j(Ljava/lang/Object;Ljava/lang/String;)V` | At entry of `c()`, inject: `iget-object v0, p0, Lv28;->v:Landroid/app/Activity;`<br>`invoke-static {v0}, Ldev/brave/extension/gestures/VideoGestureOverlay;->detach(Landroid/app/Activity;)V`. |
 
 ---
 
@@ -187,11 +189,12 @@ Display refresh rate is controlled in `WindowAndroid` (`smali/org/chromium/ui/ba
 Inspection of `recon_raw/delta/xml/locale_dirs.txt` reveals 39 resource directory configurations. Non-target locales in `res/values-*` (e.g., `values-ar`, `values-zh`, `values-ru`, `values-hi`) can be pruned during APK packaging, yielding an immediate ~22 MB size reduction.
 
 ### 7.5 Morphe Fingerprint Blueprint: Performance, Refresh Rate & Telemetry
+*(Canonical extension implementation: `dev.brave.extension.*`)*
 
 | Target Purpose | Smali Descriptor | Access & Signature | Stable Anchors (Opcodes / Strings / Registers) | Register & Injection Strategy |
 |:---|:---|:---|:---|:---|
 | **Bypass Partner Customizations & Drain Queue** | `Lorg/chromium/chrome/browser/partnercustomizations/PartnerBrowserCustomizations;` | `public final c(Landroid/content/Context;)V` | `const-string v2, "Chrome.Homepage.PartnerCustomizedDefaultGurl"`<br>`const-wide/16 v2, 0x2710`<br>`invoke-static {v1, p1, v2, v3}, Lorg/chromium/base/task/PostTask;->b(...)V` | Hook entry of `c()`: set `this.b = Boolean.TRUE;`, drain and execute all `Runnable`s in `this.d` (`ArrayList`), invoke `this.d.clear()`, and `return-void`. |
-| **Unlock Max Refresh Rate (Resolution Matched)** | `Lorg/chromium/ui/base/WindowAndroid;` | `public final r(F)V` | `iget-object v0, p0, Lorg/chromium/ui/base/WindowAndroid;->G:Ljava/util/ArrayList;`<br>`iget v0, p1, Landroid/view/WindowManager$LayoutParams;->preferredDisplayModeId:I` | Replace the refresh rate selection loop with `Lcom/morphe/brave/DisplayHelper;->getResolutionMatchedMaxModeId(Ljava/util/ArrayList;Landroid/view/Display$Mode;)I`; assign result to `preferredDisplayModeId`. |
+| **Unlock Max Refresh Rate (Resolution Matched)** | `Lorg/chromium/ui/base/WindowAndroid;` | `public final r(F)V` | `iget-object v0, p0, Lorg/chromium/ui/base/WindowAndroid;->G:Ljava/util/ArrayList;`<br>`iget v0, p1, Landroid/view/WindowManager$LayoutParams;->preferredDisplayModeId:I` | Replace the refresh rate selection loop with `Ldev/brave/extension/DisplayHelper;->getResolutionMatchedMaxModeId(Ljava/util/ArrayList;Landroid/view/Display$Mode;)I`; assign result to `preferredDisplayModeId`. |
 | **Neutralize P3A Telemetry Serialization** | `Lp3a;` | `public final a(Lmt6;)V` | `const/16 v1, 0x8`<br>`const/16 v3, 0x10`<br>`invoke-virtual {p1, v3, v2}, Lmt6;->v(II)Lmt6;` | Prepend `return-void` at line 1 of `.method public final a(Lmt6;)V` in `smali_classes2/p3a.smali`. |
 
 ---
