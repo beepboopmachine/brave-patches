@@ -1,6 +1,8 @@
 # Custom Cloned-App Branding Assets (`branding/`)
 
-This directory contains production-ready Android Adaptive Icon vector resources and branding specifications for the side-by-side cloned build (`com.brave.browser.clone` / `"Brave Mod"`).
+> **Status**: Standalone vector source assets. `ClonePackageBrandingPatch.kt` currently rewrites the manifest package name, application label, ContentProvider authorities, and custom permissions, and does **not** yet compile/inject these XML drawables into the target APK's `resources.arsc`.
+
+This directory contains Android Adaptive Icon vector source assets and branding specifications for the side-by-side cloned build (`com.brave.browser.clone` / `"Brave Mod"`).
 
 ---
 

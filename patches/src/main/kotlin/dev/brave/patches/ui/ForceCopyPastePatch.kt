@@ -9,7 +9,7 @@ import dev.brave.patches.shared.COMPATIBILITY_BRAVE
 @Suppress("unused")
 val forceCopyPastePatch = patch(
     name = "Force Copy / Paste",
-    description = "Automatically unblocks text selection, copy, cut, paste, and context menus on all web pages."
+    description = "Unblocks text selection, copy, cut, paste, and context menus on web pages where sites restrict them."
 ) {
     compatibleWith(COMPATIBILITY_BRAVE)
 

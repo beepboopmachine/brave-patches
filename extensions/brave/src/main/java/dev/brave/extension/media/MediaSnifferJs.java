@@ -1,5 +1,7 @@
 package dev.brave.extension.media;
 
+import dev.brave.extension.core.JsInjectionHub;
+
 public final class MediaSnifferJs {
     private MediaSnifferJs() {}
 
@@ -10,11 +12,14 @@ public final class MediaSnifferJs {
         "    return;\n" +
         "  }\n" +
         "  window.__brave_sniffer_installed__ = true;\n" +
+        "  var BRIDGE_TOKEN = '" + JsInjectionHub.BRIDGE_TOKEN_PLACEHOLDER + "';\n" +
+        "  var MAX_TEXT_SCAN_LEN = 1048576;\n" +
         "  try { console.log('[BraveSniffer] Universal media sniffer active on: ' + window.location.href); } catch(e) {}\n" +
         "\n" +
         "  var pendingQueue = [];\n" +
         "  var pendingIframeQueue = [];\n" +
         "  var reportedUrls = new Set();\n" +
+        "  var scannedScripts = (typeof WeakSet !== 'undefined') ? new WeakSet() : null;\n" +
         "  var lastHref = window.location.href;\n" +
         "\n" +
         "  function checkUrlChange() {\n" +
@@ -26,10 +31,12 @@ public final class MediaSnifferJs {
         "      pendingIframeQueue.length = 0;\n" +
         "      try {\n" +
         "        if (window.BraveMediaBridge && window.BraveMediaBridge.onPageUrlChanged) {\n" +
-        "          window.BraveMediaBridge.onPageUrlChanged(cur);\n" +
+        "          window.BraveMediaBridge.onPageUrlChanged(BRIDGE_TOKEN, cur);\n" +
         "        }\n" +
         "      } catch(e) {}\n" +
+        "      return true;\n" +
         "    }\n" +
+        "    return false;\n" +
         "  }\n" +
         "\n" +
         "  try {\n" +
@@ -37,8 +44,9 @@ public final class MediaSnifferJs {
         "    if (origPushState) {\n" +
         "      history.pushState = function() {\n" +
         "        var r = origPushState.apply(this, arguments);\n" +
-        "        checkUrlChange();\n" +
-        "        setTimeout(function() { try { scanDom(); flushQueue(); } catch(e) {} }, 200);\n" +
+        "        if (checkUrlChange()) {\n" +
+        "          setTimeout(function() { try { scanDom(); flushQueue(); } catch(e) {} }, 200);\n" +
+        "        }\n" +
         "        return r;\n" +
         "      };\n" +
         "    }\n" +
@@ -50,7 +58,11 @@ public final class MediaSnifferJs {
         "        return r;\n" +
         "      };\n" +
         "    }\n" +
-        "    window.addEventListener('popstate', function() { checkUrlChange(); setTimeout(function() { try { scanDom(); flushQueue(); } catch(e) {} }, 200); });\n" +
+        "    window.addEventListener('popstate', function() {\n" +
+        "      if (checkUrlChange()) {\n" +
+        "        setTimeout(function() { try { scanDom(); flushQueue(); } catch(e) {} }, 200);\n" +
+        "      }\n" +
+        "    });\n" +
         "  } catch(e) {}\n" +
         "\n" +
         "  function toAbsolute(url) {\n" +
@@ -66,14 +78,14 @@ public final class MediaSnifferJs {
         "    while (pendingQueue.length > 0) {\n" +
         "      var item = pendingQueue.shift();\n" +
         "      try {\n" +
-        "        window.BraveMediaBridge.onMediaFound(JSON.stringify(item));\n" +
+        "        window.BraveMediaBridge.onMediaFound(BRIDGE_TOKEN, JSON.stringify(item));\n" +
         "      } catch(e) {}\n" +
         "    }\n" +
         "    while (pendingIframeQueue.length > 0) {\n" +
         "      var ifr = pendingIframeQueue.shift();\n" +
         "      try {\n" +
         "        if (window.BraveMediaBridge.onIframeDetected) {\n" +
-        "          window.BraveMediaBridge.onIframeDetected(ifr.url, ifr.referer);\n" +
+        "          window.BraveMediaBridge.onIframeDetected(BRIDGE_TOKEN, ifr.url, ifr.referer);\n" +
         "        }\n" +
         "      } catch(e) {}\n" +
         "    }\n" +
@@ -107,12 +119,10 @@ public final class MediaSnifferJs {
         "      userAgent: navigator.userAgent\n" +
         "    };\n" +
         "\n" +
-        "    try { console.log('[BraveSniffer] Discovered ' + type + ': ' + absUrl + ' (quality=' + quality + ')'); } catch(e) {}\n" +
-        "\n" +
         "    if (window.BraveMediaBridge) {\n" +
         "      flushQueue();\n" +
         "      try {\n" +
-        "        window.BraveMediaBridge.onMediaFound(JSON.stringify(payload));\n" +
+        "        window.BraveMediaBridge.onMediaFound(BRIDGE_TOKEN, JSON.stringify(payload));\n" +
         "      } catch(e) {}\n" +
         "    } else {\n" +
         "      if (pendingQueue.length < 150) pendingQueue.push(payload);\n" +
@@ -167,11 +177,10 @@ public final class MediaSnifferJs {
         "    if (!lower.startsWith('http://') && !lower.startsWith('https://')) return;\n" +
         "    if (lower.indexOf('google') !== -1 || lower.indexOf('doubleclick') !== -1 || lower.indexOf('facebook') !== -1) return;\n" +
         "    reportedUrls.add('iframe:' + abs);\n" +
-        "    try { console.log('[BraveSniffer] Discovered iframe: ' + abs); } catch(e) {}\n" +
         "    if (window.BraveMediaBridge && window.BraveMediaBridge.onIframeDetected) {\n" +
         "      flushQueue();\n" +
         "      try {\n" +
-        "        window.BraveMediaBridge.onIframeDetected(abs, window.location.href);\n" +
+        "        window.BraveMediaBridge.onIframeDetected(BRIDGE_TOKEN, abs, window.location.href);\n" +
         "      } catch(e) {}\n" +
         "    } else {\n" +
         "      if (pendingIframeQueue.length < 50) pendingIframeQueue.push({ url: abs, referer: window.location.href });\n" +
@@ -181,7 +190,7 @@ public final class MediaSnifferJs {
         "  function inspectImage(img) {\n" +
         "    if (!img) return;\n" +
         "    try {\n" +
-        "      var src = img.currentSrc || img.src || img.getAttribute('data-src') || img.getAttribute('data-original') || img.getAttribute('data-lazy-src') || img.getAttribute('src');\n" +
+        "      var src = img.currentSrc || img.src || (img.getAttribute && (img.getAttribute('data-src') || img.getAttribute('data-original') || img.getAttribute('data-lazy-src') || img.getAttribute('src')));\n" +
         "      if (!src) return;\n" +
         "      var abs = toAbsolute(src);\n" +
         "      if (!abs) return;\n" +
@@ -255,7 +264,38 @@ public final class MediaSnifferJs {
         "    }\n" +
         "  }\n" +
         "\n" +
-        "  // 1. Hook window.fetch\n" +
+        "  function inspectResponseText(txt, ct, url) {\n" +
+        "    if (!txt || txt.length > MAX_TEXT_SCAN_LEN) return;\n" +
+        "    if (txt.indexOf('.m3u8') !== -1 || txt.indexOf('.mpd') !== -1 || txt.indexOf('.mp4') !== -1 || txt.indexOf('videoplayback') !== -1) {\n" +
+        "      var matches = txt.match(/https?:\\/\\/[^\\s\"'<>]+?\\.(?:m3u8|mp4|mpd|webm)[^\\s\"'<>]*/g);\n" +
+        "      if (matches) {\n" +
+        "        for (var m = 0; m < matches.length; m++) inspectUrl(matches[m], '', '', '');\n" +
+        "      }\n" +
+        "      var escMatches = txt.match(/https?:\\\\\\/\\\\\\/[^\\s\"'<>]+?\\.(?:m3u8|mp4|mpd|webm)[^\\s\"'<>]*/g);\n" +
+        "      if (escMatches) {\n" +
+        "        for (var e = 0; e < escMatches.length; e++) {\n" +
+        "          inspectUrl(escMatches[e].replace(/\\\\\\//g, '/'), '', '', '');\n" +
+        "        }\n" +
+        "      }\n" +
+        "    }\n" +
+        "    if (ct.indexOf('json') !== -1 || (url && (url.indexOf('/api/') !== -1 || url.indexOf('player') !== -1))) {\n" +
+        "      try {\n" +
+        "        var json = JSON.parse(txt);\n" +
+        "        scanObjectForStreams(json, 0);\n" +
+        "      } catch(e) {}\n" +
+        "    }\n" +
+        "  }\n" +
+        "\n" +
+        "  function isInspectableTextType(ct, url) {\n" +
+        "    var lowerCt = (ct || '').toLowerCase();\n" +
+        "    if (lowerCt.startsWith('video/') || lowerCt.startsWith('audio/') || lowerCt.startsWith('image/') || lowerCt.indexOf('octet-stream') !== -1) {\n" +
+        "      return false;\n" +
+        "    }\n" +
+        "    return lowerCt.indexOf('json') !== -1 || lowerCt.indexOf('text') !== -1 || lowerCt.indexOf('javascript') !== -1\n" +
+        "      || lowerCt.indexOf('mpegurl') !== -1 || (url && (url.indexOf('/api/') !== -1 || url.indexOf('/stream') !== -1 || url.indexOf('player') !== -1));\n" +
+        "  }\n" +
+        "\n" +
+        "  // 1. Hook window.fetch with Content-Length & MIME bounds\n" +
         "  var origFetch = window.fetch;\n" +
         "  if (origFetch) {\n" +
         "    window.fetch = function() {\n" +
@@ -271,28 +311,16 @@ public final class MediaSnifferJs {
         "        try {\n" +
         "          var resUrl = res.url || rawUrl;\n" +
         "          var ct = '';\n" +
-        "          try { ct = res.headers.get('content-type') || ''; } catch(e) {}\n" +
+        "          var cl = 0;\n" +
+        "          try {\n" +
+        "            ct = res.headers.get('content-type') || '';\n" +
+        "            cl = parseInt(res.headers.get('content-length') || '0', 10) || 0;\n" +
+        "          } catch(e) {}\n" +
         "          inspectUrl(resUrl, ct, '', '');\n" +
         "\n" +
-        "          if (ct.indexOf('json') !== -1 || ct.indexOf('text') !== -1 || resUrl.indexOf('/api/') !== -1 || resUrl.indexOf('/stream') !== -1 || resUrl.indexOf('player') !== -1) {\n" +
+        "          if (cl <= MAX_TEXT_SCAN_LEN && isInspectableTextType(ct, resUrl)) {\n" +
         "            res.clone().text().then(function(txt) {\n" +
-        "              if (!txt) return;\n" +
-        "              if (txt.indexOf('.m3u8') !== -1 || txt.indexOf('.mpd') !== -1 || txt.indexOf('.mp4') !== -1 || txt.indexOf('videoplayback') !== -1) {\n" +
-        "                var matches = txt.match(/https?:\\/\\/[^\\s\"'<>]+?\\.(?:m3u8|mp4|mpd|webm)[^\\s\"'<>]*/g);\n" +
-        "                if (matches) {\n" +
-        "                  for (var m = 0; m < matches.length; m++) inspectUrl(matches[m], '', '', '');\n" +
-        "                }\n" +
-        "                var escMatches = txt.match(/https?:\\\\\\/\\\\\\/[^\\s\"'<>]+?\\.(?:m3u8|mp4|mpd|webm)[^\\s\"'<>]*/g);\n" +
-        "                if (escMatches) {\n" +
-        "                  for (var e = 0; e < escMatches.length; e++) {\n" +
-        "                    inspectUrl(escMatches[e].replace(/\\\\\\//g, '/'), '', '', '');\n" +
-        "                  }\n" +
-        "                }\n" +
-        "              }\n" +
-        "              try {\n" +
-        "                var json = JSON.parse(txt);\n" +
-        "                scanObjectForStreams(json, 0);\n" +
-        "              } catch(e) {}\n" +
+        "              inspectResponseText(txt, ct, resUrl);\n" +
         "            }).catch(function(){});\n" +
         "          }\n" +
         "        } catch(e) {}\n" +
@@ -301,7 +329,7 @@ public final class MediaSnifferJs {
         "    };\n" +
         "  }\n" +
         "\n" +
-        "  // 2. Hook XMLHttpRequest\n" +
+        "  // 2. Hook XMLHttpRequest (supports responseType = '', 'text', and 'json')\n" +
         "  var origOpen = XMLHttpRequest.prototype.open;\n" +
         "  var origSend = XMLHttpRequest.prototype.send;\n" +
         "  XMLHttpRequest.prototype.open = function(method, url) {\n" +
@@ -319,18 +347,13 @@ public final class MediaSnifferJs {
         "          var ct = '';\n" +
         "          try { ct = xhr.getResponseHeader('Content-Type') || ''; } catch(e) {}\n" +
         "          inspectUrl(u, ct, '', '');\n" +
-        "          var txt = xhr.responseText;\n" +
-        "          if (txt && (txt.indexOf('.m3u8') !== -1 || txt.indexOf('.mp4') !== -1 || txt.indexOf('.mpd') !== -1 || txt.indexOf('videoplayback') !== -1)) {\n" +
-        "            var matches = txt.match(/https?:\\/\\/[^\\s\"'<>]+?\\.(?:m3u8|mp4|mpd|webm)[^\\s\"'<>]*/g);\n" +
-        "            if (matches) {\n" +
-        "              for (var m = 0; m < matches.length; m++) inspectUrl(matches[m], '', '', '');\n" +
+        "          var rt = xhr.responseType || '';\n" +
+        "          if (rt === 'json') {\n" +
+        "            if (xhr.response) scanObjectForStreams(xhr.response, 0);\n" +
+        "          } else if (rt === '' || rt === 'text') {\n" +
+        "            if (isInspectableTextType(ct, u)) {\n" +
+        "              inspectResponseText(xhr.responseText, ct, u);\n" +
         "            }\n" +
-        "          }\n" +
-        "          if (txt && (ct.indexOf('json') !== -1 || u.indexOf('/api/') !== -1 || u.indexOf('player') !== -1)) {\n" +
-        "            try {\n" +
-        "              var json = JSON.parse(txt);\n" +
-        "              scanObjectForStreams(json, 0);\n" +
-        "            } catch(e) {}\n" +
         "          }\n" +
         "        } catch(e) {}\n" +
         "      });\n" +
@@ -375,17 +398,14 @@ public final class MediaSnifferJs {
         "    }\n" +
         "  } catch(e) {}\n" +
         "\n" +
-        "  // 5. Active DOM Scanner\n" +
-        "  function scanDoc(doc) {\n" +
-        "    if (!doc) return;\n" +
+        "  // 5. Incremental Element & Document Scanner\n" +
+        "  function scanMediaElement(v) {\n" +
+        "    if (!v) return;\n" +
         "    try {\n" +
-        "      var videos = doc.querySelectorAll('video, audio');\n" +
-        "      for (var i = 0; i < videos.length; i++) {\n" +
-        "        var v = videos[i];\n" +
-        "        var poster = v.poster || v.getAttribute('data-poster') || v.getAttribute('poster') || '';\n" +
-        "        var vsrc = v.currentSrc || v.src || v.getAttribute('src') || v.getAttribute('data-src');\n" +
-        "        if (vsrc && !vsrc.startsWith('blob:')) inspectUrl(vsrc, '', poster, '');\n" +
-        "\n" +
+        "      var poster = v.poster || (v.getAttribute && (v.getAttribute('data-poster') || v.getAttribute('poster'))) || '';\n" +
+        "      var vsrc = v.currentSrc || v.src || (v.getAttribute && (v.getAttribute('src') || v.getAttribute('data-src')));\n" +
+        "      if (vsrc && !vsrc.startsWith('blob:')) inspectUrl(vsrc, '', poster, '');\n" +
+        "      if (v.querySelectorAll) {\n" +
         "        var sources = v.querySelectorAll('source');\n" +
         "        for (var j = 0; j < sources.length; j++) {\n" +
         "          var s = sources[j].src || sources[j].getAttribute('src') || sources[j].getAttribute('data-src');\n" +
@@ -395,13 +415,52 @@ public final class MediaSnifferJs {
         "        }\n" +
         "      }\n" +
         "    } catch(e) {}\n" +
+        "  }\n" +
         "\n" +
+        "  function scanScriptElement(sc) {\n" +
+        "    if (!sc) return;\n" +
+        "    if (scannedScripts) {\n" +
+        "      if (scannedScripts.has(sc)) return;\n" +
+        "      scannedScripts.add(sc);\n" +
+        "    }\n" +
         "    try {\n" +
-        "      var imgs = doc.querySelectorAll('img');\n" +
-        "      for (var ii = 0; ii < imgs.length; ii++) {\n" +
-        "        inspectImage(imgs[ii]);\n" +
+        "      var stxt = sc.textContent;\n" +
+        "      if (!stxt || stxt.length < 20 || stxt.length > MAX_TEXT_SCAN_LEN) return;\n" +
+        "      if (stxt.indexOf('.m3u8') !== -1 || stxt.indexOf('.mpd') !== -1 || stxt.indexOf('.mp4') !== -1 || stxt.indexOf('master') !== -1) {\n" +
+        "        var smatches = stxt.match(/https?:\\/\\/[^\\s\"'<>]+?\\.(?:m3u8|mp4|mpd|webm)[^\\s\"'<>]*/g);\n" +
+        "        if (smatches) {\n" +
+        "          for (var sm = 0; sm < smatches.length; sm++) inspectUrl(smatches[sm], '', '', '');\n" +
+        "        }\n" +
         "      }\n" +
-        "      var picSources = doc.querySelectorAll('picture source');\n" +
+        "    } catch(e) {}\n" +
+        "  }\n" +
+        "\n" +
+        "  function scanNodeSubtree(root) {\n" +
+        "    if (!root || root.nodeType !== 1 && root.nodeType !== 9) return;\n" +
+        "    if (root.nodeType === 1) {\n" +
+        "      var tag = root.tagName;\n" +
+        "      if (tag === 'VIDEO' || tag === 'AUDIO') scanMediaElement(root);\n" +
+        "      else if (tag === 'IMG') inspectImage(root);\n" +
+        "      else if (tag === 'IFRAME') {\n" +
+        "        var isrc = root.src || root.getAttribute('src') || root.getAttribute('data-src');\n" +
+        "        if (isrc) inspectIframe(isrc);\n" +
+        "      } else if (tag === 'SCRIPT') {\n" +
+        "        scanScriptElement(root);\n" +
+        "      } else if (tag === 'SOURCE') {\n" +
+        "        if (root.parentElement && (root.parentElement.tagName === 'VIDEO' || root.parentElement.tagName === 'AUDIO')) {\n" +
+        "          scanMediaElement(root.parentElement);\n" +
+        "        }\n" +
+        "      }\n" +
+        "    }\n" +
+        "    if (!root.querySelectorAll) return;\n" +
+        "    try {\n" +
+        "      var videos = root.querySelectorAll('video, audio');\n" +
+        "      for (var i = 0; i < videos.length; i++) scanMediaElement(videos[i]);\n" +
+        "    } catch(e) {}\n" +
+        "    try {\n" +
+        "      var imgs = root.querySelectorAll('img');\n" +
+        "      for (var ii = 0; ii < imgs.length; ii++) inspectImage(imgs[ii]);\n" +
+        "      var picSources = root.querySelectorAll('picture source');\n" +
         "      for (var pi = 0; pi < picSources.length; pi++) {\n" +
         "        var ss = picSources[pi].srcset || picSources[pi].getAttribute('srcset');\n" +
         "        if (ss) {\n" +
@@ -415,33 +474,22 @@ public final class MediaSnifferJs {
         "        }\n" +
         "      }\n" +
         "    } catch(e) {}\n" +
-        "\n" +
         "    try {\n" +
-        "      var iframes = doc.querySelectorAll('iframe');\n" +
+        "      var iframes = root.querySelectorAll('iframe');\n" +
         "      for (var k = 0; k < iframes.length; k++) {\n" +
         "        try {\n" +
         "          var fDoc = iframes[k].contentDocument || (iframes[k].contentWindow && iframes[k].contentWindow.document);\n" +
-        "          if (fDoc) scanDoc(fDoc);\n" +
+        "          if (fDoc) scanNodeSubtree(fDoc);\n" +
         "        } catch(e) {}\n" +
         "        try {\n" +
-        "          var isrc = iframes[k].src || iframes[k].getAttribute('src') || iframes[k].getAttribute('data-src');\n" +
-        "          if (isrc) inspectIframe(isrc);\n" +
+        "          var fsrc = iframes[k].src || iframes[k].getAttribute('src') || iframes[k].getAttribute('data-src');\n" +
+        "          if (fsrc) inspectIframe(fsrc);\n" +
         "        } catch(e) {}\n" +
         "      }\n" +
         "    } catch(e) {}\n" +
-        "\n" +
         "    try {\n" +
-        "      var scripts = doc.querySelectorAll('script');\n" +
-        "      for (var si = 0; si < scripts.length; si++) {\n" +
-        "        var stxt = scripts[si].textContent;\n" +
-        "        if (!stxt || stxt.length < 20) continue;\n" +
-        "        if (stxt.indexOf('.m3u8') !== -1 || stxt.indexOf('.mpd') !== -1 || stxt.indexOf('.mp4') !== -1 || stxt.indexOf('master') !== -1) {\n" +
-        "          var smatches = stxt.match(/https?:\\/\\/[^\\s\"'<>]+?\\.(?:m3u8|mp4|mpd|webm)[^\\s\"'<>]*/g);\n" +
-        "          if (smatches) {\n" +
-        "            for (var sm = 0; sm < smatches.length; sm++) inspectUrl(smatches[sm], '', '', '');\n" +
-        "          }\n" +
-        "        }\n" +
-        "      }\n" +
+        "      var scripts = root.querySelectorAll('script');\n" +
+        "      for (var si = 0; si < scripts.length; si++) scanScriptElement(scripts[si]);\n" +
         "    } catch(e) {}\n" +
         "  }\n" +
         "\n" +
@@ -458,22 +506,6 @@ public final class MediaSnifferJs {
         "        } catch(e) {}\n" +
         "        if (sd.hlsManifestUrl) {\n" +
         "          checkAndReport(sd.hlsManifestUrl, 'HLS_STREAM', 'application/x-mpegurl', ytTitle, 0, 0, 0, 0, ytThumb, 'HLS');\n" +
-        "        }\n" +
-        "        var ytLists = [sd.formats, sd.adaptiveFormats];\n" +
-        "        for (var li = 0; li < ytLists.length; li++) {\n" +
-        "          var list = ytLists[li];\n" +
-        "          if (!Array.isArray(list)) continue;\n" +
-        "          for (var fi = 0; fi < list.length; fi++) {\n" +
-        "            var f = list[fi];\n" +
-        "            if (!f || !f.url || typeof f.url !== 'string') continue;\n" +
-        "            var fUrl = f.url.replace(/\\\\u0026/g, '&').replace(/\\\\\\//g, '/');\n" +
-        "            if (fUrl.toLowerCase().indexOf('sabr=1') !== -1) continue;\n" +
-        "            var fMime = (f.mimeType || '').split(';')[0].trim();\n" +
-        "            var isAud = fMime.indexOf('audio/') === 0;\n" +
-        "            var qLbl = f.qualityLabel || f.quality || (isAud ? 'Audio' : '');\n" +
-        "            var fSize = parseInt(f.contentLength || '0', 10) || 0;\n" +
-        "            checkAndReport(fUrl, isAud ? 'AUDIO' : 'VIDEO', fMime, ytTitle, f.width || 0, f.height || 0, fSize, 0, ytThumb, qLbl);\n" +
-        "          }\n" +
         "        }\n" +
         "      }\n" +
         "      if (window.mediaDefinitions) scanObjectForStreams(window.mediaDefinitions, 0);\n" +
@@ -501,7 +533,7 @@ public final class MediaSnifferJs {
         "\n" +
         "  function scanDom() {\n" +
         "    checkUrlChange();\n" +
-        "    scanDoc(document);\n" +
+        "    scanNodeSubtree(document);\n" +
         "    scanGlobals();\n" +
         "  }\n" +
         "\n" +
@@ -509,12 +541,28 @@ public final class MediaSnifferJs {
         "    try { scanDom(); flushQueue(); } catch(e) {}\n" +
         "  };\n" +
         "\n" +
-        "  // 6. MutationObserver\n" +
+        "  // 6. Incremental MutationObserver (processes only added/mutated elements)\n" +
+        "  var dirtyNodes = new Set();\n" +
         "  var debounceTimer = null;\n" +
-        "  var observer = new MutationObserver(function() {\n" +
+        "  var observer = new MutationObserver(function(mutations) {\n" +
+        "    for (var i = 0; i < mutations.length; i++) {\n" +
+        "      var m = mutations[i];\n" +
+        "      if (m.type === 'attributes' && m.target && m.target.nodeType === 1) {\n" +
+        "        dirtyNodes.add(m.target);\n" +
+        "      } else if (m.addedNodes) {\n" +
+        "        for (var j = 0; j < m.addedNodes.length; j++) {\n" +
+        "          if (m.addedNodes[j].nodeType === 1) dirtyNodes.add(m.addedNodes[j]);\n" +
+        "        }\n" +
+        "      }\n" +
+        "    }\n" +
+        "    if (dirtyNodes.size === 0) return;\n" +
         "    if (debounceTimer) clearTimeout(debounceTimer);\n" +
         "    debounceTimer = setTimeout(function() {\n" +
-        "      scanDom();\n" +
+        "      var batch = Array.from(dirtyNodes);\n" +
+        "      dirtyNodes.clear();\n" +
+        "      for (var b = 0; b < batch.length; b++) {\n" +
+        "        try { scanNodeSubtree(batch[b]); } catch(e) {}\n" +
+        "      }\n" +
         "      flushQueue();\n" +
         "    }, 250);\n" +
         "  });\n" +
@@ -530,10 +578,15 @@ public final class MediaSnifferJs {
         "  }\n" +
         "  attachObserver();\n" +
         "\n" +
+        "  // Lightweight SPA URL-change watcher (does NOT rescan DOM unless URL changed)\n" +
         "  setInterval(function() {\n" +
-        "    try { scanDom(); } catch(e) {}\n" +
-        "    flushQueue();\n" +
-        "  }, 1000);\n" +
+        "    try {\n" +
+        "      if (checkUrlChange()) {\n" +
+        "        scanDom();\n" +
+        "        flushQueue();\n" +
+        "      }\n" +
+        "    } catch(e) {}\n" +
+        "  }, 2000);\n" +
         "\n" +
         "  window.addEventListener('load', function() {\n" +
         "    try { scanDom(); flushQueue(); } catch(e) {}\n" +

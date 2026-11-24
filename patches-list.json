@@ -266,7 +266,7 @@
     },
     {
       "name": "Force Copy / Paste",
-      "description": "Automatically unblocks text selection, copy, cut, paste, and context menus on all web pages.",
+      "description": "Unblocks text selection, copy, cut, paste, and context menus on web pages where sites restrict them.",
       "default": true,
       "category": null,
       "compatiblePackages": [

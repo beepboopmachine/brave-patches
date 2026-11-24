@@ -62,6 +62,38 @@ public final class MediaPickerBottomSheet {
     public static final Set<String> ACTIVE_DOWNLOAD_URLS = Collections.newSetFromMap(new ConcurrentHashMap<>());
     public static volatile boolean sBulkImagesDownloading = false;
 
+    // Live UI callbacks for open bottom sheets when background service downloads finish
+    private static final java.util.Map<String, java.lang.ref.WeakReference<java.util.function.Consumer<Boolean>>> DOWNLOAD_UI_CALLBACKS =
+            new ConcurrentHashMap<>();
+
+    public static void notifyDownloadFinished(final String url, final boolean success) {
+        if (url == null || url.isEmpty()) return;
+        java.lang.ref.WeakReference<java.util.function.Consumer<Boolean>> ref = DOWNLOAD_UI_CALLBACKS.remove(url);
+        if (ref != null) {
+            final java.util.function.Consumer<Boolean> cb = ref.get();
+            if (cb != null) {
+                new Handler(Looper.getMainLooper()).post(() -> {
+                    try { cb.accept(success); } catch (Throwable ignored) {}
+                });
+            }
+        }
+    }
+
+    private static void registerButtonCompletionCallback(final String url, final Activity activity, final Button dlBtn, final boolean isDark) {
+        if (url == null || url.isEmpty() || dlBtn == null) return;
+        DOWNLOAD_UI_CALLBACKS.put(url, new java.lang.ref.WeakReference<>(success -> {
+            if (success) {
+                dlBtn.setText("DOWNLOADED ✓");
+                dlBtn.setEnabled(true);
+                styleButton(dlBtn, Color.parseColor(isDark ? "#143D1A" : "#D4EDDA"), Color.parseColor(isDark ? "#81C784" : "#155724"), dp(activity, 6));
+            } else {
+                dlBtn.setText("Download");
+                dlBtn.setEnabled(true);
+                styleButton(dlBtn, Color.parseColor("#FF5500"), Color.WHITE, dp(activity, 6));
+            }
+        }));
+    }
+
     private static volatile Method sNativeDownloadUrlMethod = null;
     private static volatile boolean sNativeDownloadLookupDone = false;
 
@@ -199,6 +231,12 @@ public final class MediaPickerBottomSheet {
             if (activity.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
                 try {
                     activity.requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 101);
+                } catch (Throwable ignored) {}
+            }
+        } else if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            if (activity.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                try {
+                    activity.requestPermissions(new String[]{android.Manifest.permission.WRITE_EXTERNAL_STORAGE}, 102);
                 } catch (Throwable ignored) {}
             }
         }
@@ -735,7 +773,7 @@ public final class MediaPickerBottomSheet {
                 .start();
     }
 
-    private static void launchBulkImageDownload(Activity activity, List<MediaItem> targetImages, boolean convertWebp, Button bulkBtn, boolean isDark) {
+    private static void launchBulkImageDownload(final Activity activity, final List<MediaItem> targetImages, final boolean convertWebp, final Button bulkBtn, final boolean isDark) {
         if (targetImages == null || targetImages.isEmpty()) return;
         sBulkImagesDownloading = true;
         bulkBtn.setText("DOWNLOADING IMAGES...");
@@ -744,22 +782,27 @@ public final class MediaPickerBottomSheet {
 
         final Handler mainHandler = new Handler(Looper.getMainLooper());
         final int total = targetImages.size();
-        final java.util.concurrent.atomic.AtomicInteger completed = new java.util.concurrent.atomic.AtomicInteger(0);
+        final java.util.concurrent.atomic.AtomicInteger nextIndex = new java.util.concurrent.atomic.AtomicInteger(0);
+        final java.util.concurrent.atomic.AtomicInteger finishedCount = new java.util.concurrent.atomic.AtomicInteger(0);
+        final java.util.concurrent.atomic.AtomicInteger successCount = new java.util.concurrent.atomic.AtomicInteger(0);
+        final int maxConcurrent = Math.min(3, total);
 
-        for (int i = 0; i < total; i++) {
-            final MediaItem im = targetImages.get(i);
-            final int idx = i;
-            PatchPrefs.markMediaDownloaded(activity, im.url, "done");
+        final Runnable[] dispatchNextRef = new Runnable[1];
+        dispatchNextRef[0] = () -> {
+            int idx = nextIndex.getAndIncrement();
+            if (idx >= total) return;
 
-            String lowerUrl = im.url.toLowerCase(Locale.ROOT);
+            final MediaItem im = targetImages.get(idx);
+            String pathLower = extractPathLower(im.url);
+            String mimeLower = im.mimeType != null ? im.mimeType.toLowerCase(Locale.ROOT) : "";
             String ext = ".jpg";
             String mime = "image/jpeg";
-            if (lowerUrl.contains(".png")) { ext = ".png"; mime = "image/png"; }
-            else if (lowerUrl.contains(".webp")) { ext = convertWebp ? ".png" : ".webp"; mime = convertWebp ? "image/png" : "image/webp"; }
-            else if (lowerUrl.contains(".gif")) { ext = ".gif"; mime = "image/gif"; }
-            else if (lowerUrl.contains(".avif")) { ext = ".avif"; mime = "image/avif"; }
-            else if (lowerUrl.contains(".bmp")) { ext = ".bmp"; mime = "image/bmp"; }
-            else if (lowerUrl.contains(".heic") || lowerUrl.contains(".heif")) { ext = ".heic"; mime = "image/heic"; }
+            if (mimeLower.contains("png") || pathLower.endsWith(".png")) { ext = ".png"; mime = "image/png"; }
+            else if (mimeLower.contains("webp") || pathLower.endsWith(".webp")) { ext = ".webp"; mime = "image/webp"; }
+            else if (mimeLower.contains("gif") || pathLower.endsWith(".gif")) { ext = ".gif"; mime = "image/gif"; }
+            else if (mimeLower.contains("avif") || pathLower.endsWith(".avif")) { ext = ".avif"; mime = "image/avif"; }
+            else if (mimeLower.contains("bmp") || pathLower.endsWith(".bmp")) { ext = ".bmp"; mime = "image/bmp"; }
+            else if (mimeLower.contains("heic") || pathLower.endsWith(".heic") || pathLower.endsWith(".heif")) { ext = ".heic"; mime = "image/heic"; }
 
             String clean = getCleanFileName(im.url);
             if (clean == null || clean.isEmpty() || clean.equalsIgnoreCase("Video") || clean.equalsIgnoreCase("image")) {
@@ -769,22 +812,52 @@ public final class MediaPickerBottomSheet {
             }
             final String finalFilename = clean;
             final String finalMime = mime;
+            final String expectedSavedName = (convertWebp && finalFilename.toLowerCase(Locale.ROOT).endsWith(".webp"))
+                    ? (finalFilename.substring(0, finalFilename.length() - 5) + ".png")
+                    : finalFilename;
 
-            // Stagger native DownloadManager triggers by 150ms so Chromium enqueues every single image cleanly
-            mainHandler.postDelayed(() -> {
-                String relayUrl = LocalDownloadRelay.startRelay(im, finalFilename, finalMime, convertWebp, () -> {
-                    if (completed.incrementAndGet() >= total) {
-                        sBulkImagesDownloading = false;
-                        mainHandler.post(() -> {
+            final java.util.concurrent.atomic.AtomicBoolean itemHandled = new java.util.concurrent.atomic.AtomicBoolean(false);
+            final java.util.function.Consumer<Boolean> finishItem = (succeeded) -> {
+                if (!itemHandled.compareAndSet(false, true)) return;
+                if (succeeded) {
+                    successCount.incrementAndGet();
+                    PatchPrefs.markMediaDownloaded(activity, im.url, expectedSavedName);
+                }
+                int done = finishedCount.incrementAndGet();
+                if (done >= total) {
+                    sBulkImagesDownloading = false;
+                    final int ok = successCount.get();
+                    mainHandler.post(() -> {
+                        bulkBtn.setEnabled(true);
+                        if (ok == total) {
                             bulkBtn.setText("ALL DOWNLOADED ✓ (" + total + " Images)");
-                            bulkBtn.setEnabled(true);
                             styleButton(bulkBtn, Color.parseColor(isDark ? "#143D1A" : "#D4EDDA"), Color.parseColor(isDark ? "#81C784" : "#155724"), dp(activity, 8));
-                        });
-                    }
-                });
-                String targetUrl = (relayUrl != null) ? relayUrl : im.url;
-                triggerChromiumNativeDownload(targetUrl);
-            }, idx * 150L);
+                        } else if (ok > 0) {
+                            bulkBtn.setText("Downloaded " + ok + "/" + total + " (Tap to Retry)");
+                            styleButton(bulkBtn, Color.parseColor(isDark ? "#4A2800" : "#FFE0B2"), Color.parseColor(isDark ? "#FFA726" : "#E65100"), dp(activity, 8));
+                        } else {
+                            bulkBtn.setText("Download Failed (Tap to Retry)");
+                            styleButton(bulkBtn, Color.parseColor("#FF5500"), Color.WHITE, dp(activity, 8));
+                        }
+                    });
+                } else {
+                    mainHandler.postDelayed(dispatchNextRef[0], 120L);
+                }
+            };
+
+            String relayUrl = LocalDownloadRelay.startRelay(im, finalFilename, finalMime, convertWebp, finishItem);
+            if (relayUrl == null) {
+                finishItem.accept(false);
+                return;
+            }
+            boolean triggered = triggerChromiumNativeDownload(relayUrl);
+            if (!triggered) {
+                finishItem.accept(false);
+            }
+        };
+
+        for (int w = 0; w < maxConcurrent; w++) {
+            mainHandler.postDelayed(dispatchNextRef[0], w * 150L);
         }
 
         Toast.makeText(activity, "Downloading " + total + " image(s) in Brave Downloads", Toast.LENGTH_SHORT).show();
@@ -1025,6 +1098,21 @@ public final class MediaPickerBottomSheet {
     }
 
     private static void triggerDownload(final Activity activity, final MediaItem item, final Button dlBtn, final boolean isDark) {
+        if (item.type == MediaType.DASH_STREAM) {
+            Toast.makeText(activity, "DASH (.mpd) streams are not supported for download", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            if (activity.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                try {
+                    activity.requestPermissions(new String[]{android.Manifest.permission.WRITE_EXTERNAL_STORAGE}, 102);
+                } catch (Throwable ignored) {}
+                Toast.makeText(activity, "Please grant storage permission and try again", Toast.LENGTH_LONG).show();
+                return;
+            }
+        }
+
         ACTIVE_DOWNLOAD_URLS.add(item.url);
         dlBtn.setText("DOWNLOADING...");
         dlBtn.setEnabled(false);
@@ -1033,30 +1121,45 @@ public final class MediaPickerBottomSheet {
         if (item.type == MediaType.HLS_STREAM && item.variants.size() > 1) {
             showQualitySelectorAndDownload(activity, item, dlBtn, isDark);
         } else if (item.type == MediaType.HLS_STREAM) {
-            startMediaDownload(activity, item);
-            PatchPrefs.markMediaDownloaded(activity, item.url, "done");
+            item.trackingUrl = item.url;
+            registerButtonCompletionCallback(item.url, activity, dlBtn, isDark);
+            startMediaDownload(activity, item, dlBtn);
         } else {
             startDirectDownloadNative(activity, item, dlBtn, isDark);
+        }
+    }
+
+    private static String extractPathLower(String url) {
+        if (url == null || url.isEmpty()) return "";
+        try {
+            String path = Uri.parse(url).getPath();
+            return path != null ? path.toLowerCase(Locale.ROOT) : "";
+        } catch (Throwable ignored) {
+            return "";
         }
     }
 
     private static void startDirectDownloadNative(final Activity activity, final MediaItem item, final Button dlBtn, final boolean isDark) {
         String ext = item.type == MediaType.AUDIO ? ".mp3" : ".mp4";
         String defaultMime = item.type == MediaType.AUDIO ? "audio/mpeg" : "video/mp4";
-        String lowerUrl = item.url.toLowerCase(Locale.ROOT);
-        if (lowerUrl.contains(".webm")) { ext = ".webm"; defaultMime = "video/webm"; }
-        else if (lowerUrl.contains(".mkv")) { ext = ".mkv"; defaultMime = "video/x-matroska"; }
-        else if (lowerUrl.contains(".mov")) { ext = ".mov"; defaultMime = "video/quicktime"; }
-        else if (lowerUrl.contains(".avi")) { ext = ".avi"; defaultMime = "video/x-msvideo"; }
-        else if (lowerUrl.contains(".flv") || lowerUrl.contains(".f4v")) { ext = ".flv"; defaultMime = "video/x-flv"; }
-        else if (lowerUrl.contains(".3gp")) { ext = ".3gp"; defaultMime = "video/3gpp"; }
-        else if (lowerUrl.contains(".ogv")) { ext = ".ogv"; defaultMime = "video/ogg"; }
-        else if (lowerUrl.contains(".gif")) { ext = ".gif"; defaultMime = "image/gif"; }
-        else if (lowerUrl.contains(".m4a")) { ext = ".m4a"; defaultMime = "audio/mp4"; }
-        else if (lowerUrl.contains(".aac")) { ext = ".aac"; defaultMime = "audio/aac"; }
-        else if (lowerUrl.contains(".ogg") || lowerUrl.contains(".opus")) { ext = ".ogg"; defaultMime = "audio/ogg"; }
-        else if (lowerUrl.contains(".flac")) { ext = ".flac"; defaultMime = "audio/flac"; }
-        else if (lowerUrl.contains(".wav")) { ext = ".wav"; defaultMime = "audio/wav"; }
+        String mimeLower = item.mimeType != null ? item.mimeType.toLowerCase(Locale.ROOT) : "";
+        String pathLower = extractPathLower(item.url);
+
+        if (mimeLower.contains("webm") || pathLower.endsWith(".webm")) { ext = ".webm"; defaultMime = "video/webm"; }
+        else if (mimeLower.contains("matroska") || pathLower.endsWith(".mkv")) { ext = ".mkv"; defaultMime = "video/x-matroska"; }
+        else if (mimeLower.contains("quicktime") || pathLower.endsWith(".mov")) { ext = ".mov"; defaultMime = "video/quicktime"; }
+        else if (mimeLower.contains("x-msvideo") || pathLower.endsWith(".avi")) { ext = ".avi"; defaultMime = "video/x-msvideo"; }
+        else if (mimeLower.contains("x-flv") || pathLower.endsWith(".flv") || pathLower.endsWith(".f4v")) { ext = ".flv"; defaultMime = "video/x-flv"; }
+        else if (mimeLower.contains("3gpp") || pathLower.endsWith(".3gp")) { ext = ".3gp"; defaultMime = "video/3gpp"; }
+        else if (mimeLower.equals("video/ogg") || pathLower.endsWith(".ogv")) { ext = ".ogv"; defaultMime = "video/ogg"; }
+        else if (mimeLower.equals("image/gif") || pathLower.endsWith(".gif")) { ext = ".gif"; defaultMime = "image/gif"; }
+        else if (mimeLower.equals("audio/mp4") || pathLower.endsWith(".m4a")) { ext = ".m4a"; defaultMime = "audio/mp4"; }
+        else if (mimeLower.equals("audio/aac") || pathLower.endsWith(".aac")) { ext = ".aac"; defaultMime = "audio/aac"; }
+        else if (mimeLower.equals("audio/ogg") || mimeLower.equals("audio/opus") || pathLower.endsWith(".ogg") || pathLower.endsWith(".opus")) { ext = ".ogg"; defaultMime = "audio/ogg"; }
+        else if (mimeLower.equals("audio/flac") || pathLower.endsWith(".flac")) { ext = ".flac"; defaultMime = "audio/flac"; }
+        else if (mimeLower.equals("audio/wav") || pathLower.endsWith(".wav")) { ext = ".wav"; defaultMime = "audio/wav"; }
+        else if (mimeLower.equals("video/mp4") || pathLower.endsWith(".mp4") || pathLower.endsWith(".m4v")) { ext = ".mp4"; defaultMime = "video/mp4"; }
+
         final String resolvedMime = (item.mimeType != null && !item.mimeType.isEmpty()) ? item.mimeType : defaultMime;
         String clean = getCleanFileName(item.url);
         String lowerClean = clean.toLowerCase(Locale.ROOT);
@@ -1071,7 +1174,25 @@ public final class MediaPickerBottomSheet {
         }
         final String filename = clean.contains(".") ? clean : (clean + ext);
 
-        // 0. Adaptive HD YouTube Video + Audio mux path (downloads video+audio, muxes via MediaMuxer, serves to Brave Downloads!)
+        final java.util.function.Consumer<Boolean> updateButtonOnFinish = (succeeded) -> {
+            ACTIVE_DOWNLOAD_URLS.remove(item.url);
+            if (succeeded) {
+                PatchPrefs.markMediaDownloaded(activity, item.url, filename);
+            }
+            new Handler(Looper.getMainLooper()).post(() -> {
+                dlBtn.setEnabled(true);
+                if (succeeded) {
+                    dlBtn.setText("DOWNLOADED ✓");
+                    styleButton(dlBtn, Color.parseColor(isDark ? "#143D1A" : "#D4EDDA"), Color.parseColor(isDark ? "#81C784" : "#155724"), dp(activity, 6));
+                } else {
+                    dlBtn.setText("Download");
+                    styleButton(dlBtn, Color.parseColor("#FF5500"), Color.WHITE, dp(activity, 6));
+                    Toast.makeText(activity, "Download failed for " + filename, Toast.LENGTH_SHORT).show();
+                }
+            });
+        };
+
+        // 0. Adaptive HD YouTube Video + Audio mux path
         if (item.audioUrl != null && !item.audioUrl.isEmpty()) {
             Toast.makeText(activity, "Preparing HD video + audio: " + filename, Toast.LENGTH_SHORT).show();
             LocalDownloadRelay.startMuxedDownload(
@@ -1080,65 +1201,52 @@ public final class MediaPickerBottomSheet {
                     filename,
                     null,
                     muxRelayUrl -> {
-                        if (triggerChromiumNativeDownload(muxRelayUrl)) {
-                            PatchPrefs.markMediaDownloaded(activity, item.url, filename);
+                        if (!triggerChromiumNativeDownload(muxRelayUrl)) {
+                            updateButtonOnFinish.accept(false);
                         }
                     },
-                    () -> {
-                        ACTIVE_DOWNLOAD_URLS.remove(item.url);
-                        new Handler(Looper.getMainLooper()).post(() -> {
-                            dlBtn.setText("DOWNLOADED ✓");
-                            dlBtn.setEnabled(true);
-                            styleButton(dlBtn, Color.parseColor(isDark ? "#143D1A" : "#D4EDDA"), Color.parseColor(isDark ? "#81C784" : "#155724"), dp(activity, 6));
-                        });
-                    }
+                    updateButtonOnFinish
             );
             return;
         }
 
-        // 1. Primary path: Stream via 1-shot LocalDownloadRelay (injects exact Referer/Cookie/UA)
-        // straight into Brave's native C++ content::DownloadManager (J.N.VOO 0x13)!
-        // Appears IMMEDIATELY in Brave's Downloads section with live progress & ZERO 403 errors.
-        String relayUrl = LocalDownloadRelay.startRelay(item, filename, resolvedMime, () -> {
-            ACTIVE_DOWNLOAD_URLS.remove(item.url);
-            new Handler(Looper.getMainLooper()).post(() -> {
-                dlBtn.setText("DOWNLOADED ✓");
-                dlBtn.setEnabled(true);
-                styleButton(dlBtn, Color.parseColor(isDark ? "#143D1A" : "#D4EDDA"), Color.parseColor(isDark ? "#81C784" : "#155724"), dp(activity, 6));
-            });
-        });
+        // 1. Primary path: Stream via authenticated 1-shot LocalDownloadRelay into Brave's native DownloadManager
+        String relayUrl = LocalDownloadRelay.startRelay(item, filename, resolvedMime, updateButtonOnFinish);
 
-        String targetUrl = (relayUrl != null) ? relayUrl : item.url;
-        if (triggerChromiumNativeDownload(targetUrl)) {
-            PatchPrefs.markMediaDownloaded(activity, item.url, filename);
+        if (relayUrl != null && triggerChromiumNativeDownload(relayUrl)) {
             Toast.makeText(activity, "Downloading in Brave Downloads: " + filename, Toast.LENGTH_SHORT).show();
             return;
         }
 
-        // 2. Fallback: Android system DownloadManager
+        // 2. Fallback: Android system DownloadManager (with safe Referer & Cookie)
         try {
             DownloadManager dm = (DownloadManager) activity.getSystemService(Context.DOWNLOAD_SERVICE);
             if (dm != null) {
+                String refPage = (item.pageUrl != null && !item.pageUrl.isEmpty()) ? item.pageUrl : item.referer;
+                String safeRef = NetworkSafety.computeSafeReferer(refPage, item.url);
+                String safeCookie = NetworkSafety.computeSafeCookie(item.cookie, item.cookieSourceUrl, item.url);
                 DownloadManager.Request req = new DownloadManager.Request(Uri.parse(item.url));
                 req.setTitle(item.title != null && !item.title.isEmpty() ? item.title : filename);
                 req.setDescription("Downloading " + filename);
                 req.setMimeType(resolvedMime);
                 if (item.userAgent != null && !item.userAgent.isEmpty()) req.addRequestHeader("User-Agent", item.userAgent);
-                if (item.cookie != null && !item.cookie.isEmpty()) req.addRequestHeader("Cookie", item.cookie);
-                if (item.referer != null && !item.referer.isEmpty()) req.addRequestHeader("Referer", item.referer);
+                if (!safeCookie.isEmpty()) req.addRequestHeader("Cookie", safeCookie);
+                if (!safeRef.isEmpty()) req.addRequestHeader("Referer", safeRef);
                 req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
                 req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, filename);
                 dm.enqueue(req);
-                PatchPrefs.markMediaDownloaded(activity, item.url, filename);
+                ACTIVE_DOWNLOAD_URLS.remove(item.url);
+                dlBtn.setText("Download");
+                dlBtn.setEnabled(true);
+                styleButton(dlBtn, Color.parseColor("#FF5500"), Color.WHITE, dp(activity, 6));
                 Toast.makeText(activity, "Download started: " + filename, Toast.LENGTH_SHORT).show();
+                return;
             }
         } catch (Throwable t) {
-            ACTIVE_DOWNLOAD_URLS.remove(item.url);
-            Toast.makeText(activity, "Download failed: " + t.getMessage(), Toast.LENGTH_LONG).show();
-            dlBtn.setText("Download");
-            dlBtn.setEnabled(true);
-            styleButton(dlBtn, Color.parseColor("#FF5500"), Color.WHITE, dp(activity, 6));
+            Log.w(TAG, "DownloadManager fallback failed", t);
         }
+
+        updateButtonOnFinish.accept(false);
     }
 
     private static void showQualitySelectorAndDownload(
@@ -1152,8 +1260,15 @@ public final class MediaPickerBottomSheet {
         String[] labels = new String[variants.size()];
         for (int i = 0; i < variants.size(); i++) {
             MediaItem.HlsVariant v = variants.get(i);
-            labels[i] = v.getResolutionLabel() + " (" + (v.bandwidth / 1000) + " kbps)";
+            labels[i] = v.getResolutionLabel() + (v.bandwidth > 0 ? (" (" + (v.bandwidth / 1000) + " kbps)") : "");
         }
+
+        final Runnable cancelAction = () -> {
+            ACTIVE_DOWNLOAD_URLS.remove(item.url);
+            dlBtn.setText("Download");
+            dlBtn.setEnabled(true);
+            styleButton(dlBtn, Color.parseColor("#FF5500"), Color.WHITE, dp(activity, 6));
+        };
 
         new AlertDialog.Builder(activity)
                 .setTitle("Select Stream Quality")
@@ -1165,15 +1280,15 @@ public final class MediaPickerBottomSheet {
                             item.mimeType, item.sizeBytes, chosen.width, chosen.height,
                             item.durationMs, item.userAgent, item.cookie, item.referer, item.tabId
                     );
-                    startMediaDownload(activity, chosenItem);
-                    PatchPrefs.markMediaDownloaded(activity, item.url, "done");
+                    chosenItem.trackingUrl = item.url;
+                    chosenItem.audioUrl = chosen.audioPlaylistUrl != null ? chosen.audioPlaylistUrl : "";
+                    chosenItem.cookieSourceUrl = item.cookieSourceUrl;
+                    chosenItem.pageUrl = item.pageUrl;
+                    registerButtonCompletionCallback(item.url, activity, dlBtn, isDark);
+                    startMediaDownload(activity, chosenItem, dlBtn);
                 })
-                .setNegativeButton("Cancel", (d, which) -> {
-                    ACTIVE_DOWNLOAD_URLS.remove(item.url);
-                    dlBtn.setText("Download");
-                    dlBtn.setEnabled(true);
-                    styleButton(dlBtn, Color.parseColor("#FF5500"), Color.WHITE, dp(activity, 6));
-                })
+                .setNegativeButton("Cancel", (d, which) -> cancelAction.run())
+                .setOnCancelListener(d -> cancelAction.run())
                 .show();
     }
 
@@ -1282,9 +1397,9 @@ public final class MediaPickerBottomSheet {
         return row;
     }
 
-    private static void startMediaDownload(Context ctx, MediaItem item) {
+    private static void startMediaDownload(Context ctx, MediaItem item, Button dlBtn) {
+        String jobId = UUID.randomUUID().toString();
         try {
-            String jobId = UUID.randomUUID().toString();
             MediaDownloadService.PENDING_JOBS.put(jobId, item);
             Intent intent = new Intent(ctx, MediaDownloadService.class);
             intent.setAction(MediaDownloadService.ACTION_DOWNLOAD_MEDIA);
@@ -1293,14 +1408,25 @@ public final class MediaPickerBottomSheet {
             else ctx.startService(intent);
             Toast.makeText(ctx, "Starting HLS download...", Toast.LENGTH_SHORT).show();
         } catch (Throwable t) {
+            MediaDownloadService.PENDING_JOBS.remove(jobId);
             ACTIVE_DOWNLOAD_URLS.remove(item.url);
+            if (item.trackingUrl != null && !item.trackingUrl.isEmpty()) {
+                ACTIVE_DOWNLOAD_URLS.remove(item.trackingUrl);
+                DOWNLOAD_UI_CALLBACKS.remove(item.trackingUrl);
+            }
+            DOWNLOAD_UI_CALLBACKS.remove(item.url);
+            if (dlBtn != null) {
+                dlBtn.setText("Download");
+                dlBtn.setEnabled(true);
+                styleButton(dlBtn, Color.parseColor("#FF5500"), Color.WHITE, dp(ctx, 6));
+            }
             Toast.makeText(ctx, "Failed starting download service: " + t.getMessage(), Toast.LENGTH_LONG).show();
         }
     }
 
     private static void startBulkImageDownload(Context ctx, List<MediaItem> images, boolean convertWebp) {
+        String jobId = UUID.randomUUID().toString();
         try {
-            String jobId = UUID.randomUUID().toString();
             MediaDownloadService.PENDING_JOBS.put(jobId, new ArrayList<>(images));
             Intent intent = new Intent(ctx, MediaDownloadService.class);
             intent.setAction(MediaDownloadService.ACTION_DOWNLOAD_IMAGES);
@@ -1310,6 +1436,7 @@ public final class MediaPickerBottomSheet {
             else ctx.startService(intent);
             Toast.makeText(ctx, "Downloading " + images.size() + " images...", Toast.LENGTH_SHORT).show();
         } catch (Throwable t) {
+            MediaDownloadService.PENDING_JOBS.remove(jobId);
             sBulkImagesDownloading = false;
             Toast.makeText(ctx, "Failed starting image download: " + t.getMessage(), Toast.LENGTH_LONG).show();
         }

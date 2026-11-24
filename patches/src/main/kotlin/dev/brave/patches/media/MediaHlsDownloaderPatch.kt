@@ -81,7 +81,7 @@ val mediaHlsDownloaderPatch = patch(
             )
         }
 
-        // 3. Hook ToggleTabStackButton.i(I)V to dynamically extract ColorStateList destination register
+        // 3. Hook ToggleTabStackButton.i(I)V to dynamically extract ColorStateList destination register (per-window)
         ToolbarTintFingerprint.method.apply {
             val callIdx = instructions.indices.indexOfFirst { idx ->
                 val inst = instructions[idx]
@@ -94,18 +94,28 @@ val mediaHlsDownloaderPatch = patch(
             }
             val moveInst = instructions[callIdx + 1] as OneRegisterInstruction
             val colorReg = moveInst.registerA
+            val totalRegs = implementation?.registerCount ?: 16
+            // Non-static method with 1 int param (p0=this, p1=int): p0 register index is totalRegs - 2
+            val p0Reg = totalRegs - 2
 
-            addInstructions(
-                callIdx + 2,
-                "invoke-static/range {v$colorReg .. v$colorReg}, $TOOLBAR_HOOK->onTintChanged(Landroid/content/res/ColorStateList;)V"
-            )
+            if (p0Reg in 0..15 && colorReg in 0..15) {
+                addInstructions(
+                    callIdx + 2,
+                    "invoke-static {p0, v$colorReg}, $TOOLBAR_HOOK->onTintChanged(Landroid/view/View;Landroid/content/res/ColorStateList;)V"
+                )
+            } else {
+                addInstructions(
+                    callIdx + 2,
+                    "invoke-static/range {v$colorReg .. v$colorReg}, $TOOLBAR_HOOK->onTintChanged(Landroid/content/res/ColorStateList;)V"
+                )
+            }
         }
 
-        // 4. Hook ToolbarPhone.d3(Z)V to toggle button visibility during Omnibox typing animation
+        // 4. Hook ToolbarPhone.d3(Z)V to toggle button visibility per-window during Omnibox typing animation
         ToolbarUrlFocusFingerprint.method.apply {
             addInstructions(
                 0,
-                "invoke-static/range {p1 .. p1}, $TOOLBAR_HOOK->onUrlFocusChanged(Z)V"
+                "invoke-static/range {p0 .. p1}, $TOOLBAR_HOOK->onUrlFocusChanged(Landroid/view/ViewGroup;Z)V"
             )
         }
 

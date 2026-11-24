@@ -28,7 +28,7 @@ val forceMaxRefreshRatePatch = patch(
     extendWith("extensions/brave.mpe")
 
     execute {
-        // Insert cleanly at entry (index 0) with zero internal branch labels and zero parameter clobbering
+        // Attempt resolution-matched max refresh rate; fall through to Chromium's original logic if unavailable
         WindowAndroidRefreshRateFingerprint.method.apply {
             addInstructions(
                 0,
@@ -36,8 +36,12 @@ val forceMaxRefreshRatePatch = patch(
                     iget-object v0, p0, Lorg/chromium/ui/base/WindowAndroid;->G:Ljava/util/ArrayList;
                     invoke-virtual {p0}, Lorg/chromium/ui/base/WindowAndroid;->A()Landroid/view/Window;
                     move-result-object v1
-                    invoke-static {v1, v0}, $DISPLAY_HELPER->forceMaxRefreshRateForWindow(Landroid/view/Window;Ljava/util/List;)V
+                    invoke-static {v1, v0}, $DISPLAY_HELPER->tryForceMaxRefreshRateForWindow(Landroid/view/Window;Ljava/util/List;)Z
+                    move-result v0
+                    if-eqz v0, :fallback_original
                     return-void
+                    :fallback_original
+                    nop
                 """.trimIndent()
             )
         }

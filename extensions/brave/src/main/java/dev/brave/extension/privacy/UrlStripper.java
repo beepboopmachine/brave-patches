@@ -1,6 +1,9 @@
 package dev.brave.extension.privacy;
 
+import java.io.ByteArrayOutputStream;
 import java.lang.reflect.Field;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Locale;
@@ -24,16 +27,15 @@ public class UrlStripper {
             return input;
         }
 
-        // If the whole string is a single pure URL (starts with http(s):// and no whitespace)
-        String lowerTrimmed = input.trim().toLowerCase(Locale.ROOT);
+        String trimmed = input.trim();
+        String lowerTrimmed = trimmed.toLowerCase(Locale.ROOT);
         boolean isDirectUrl = (lowerTrimmed.startsWith("http://") || lowerTrimmed.startsWith("https://"))
-                && !containsWhitespace(input.trim());
+                && !containsWhitespace(trimmed);
 
         if (isDirectUrl) {
-            return sanitizeSingleUrl(input.trim());
+            return sanitizeSingleUrl(trimmed);
         }
 
-        // If the string contains a URL mixed with text (e.g. "Page Title https://example.com/...")
         Matcher matcher = URL_PATTERN.matcher(input);
         if (matcher.find()) {
             StringBuffer sb = new StringBuffer();
@@ -77,18 +79,16 @@ public class UrlStripper {
                 return base + fragment;
             }
 
-            String baseLower = base.toLowerCase(Locale.ROOT);
-            boolean isMediaHost = baseLower.contains("youtube.com") 
-                    || baseLower.contains("youtu.be") 
-                    || baseLower.contains("spotify.com");
+            boolean isMediaHost = isSiStrippableMediaHost(base);
 
             String[] pairs = queryString.split("&");
             StringBuilder newQuery = new StringBuilder();
             for (String pair : pairs) {
                 if (pair.isEmpty()) continue;
                 int eqIdx = pair.indexOf('=');
-                String key = eqIdx >= 0 ? pair.substring(0, eqIdx) : pair;
-                if (isTrackingParam(key, isMediaHost)) {
+                String rawKey = eqIdx >= 0 ? pair.substring(0, eqIdx) : pair;
+                String decodedKey = decodePercentOnce(rawKey);
+                if (isTrackingParam(decodedKey, isMediaHost)) {
                     continue;
                 }
                 if (newQuery.length() > 0) {
@@ -107,16 +107,65 @@ public class UrlStripper {
         }
     }
 
+    private static boolean isSiStrippableMediaHost(String baseUrl) {
+        try {
+            URI uri = URI.create(baseUrl);
+            String host = uri.getHost();
+            if (host == null || host.isEmpty()) return false;
+            String h = host.toLowerCase(Locale.ROOT);
+            while (h.endsWith(".")) {
+                h = h.substring(0, h.length() - 1);
+            }
+            return "youtube.com".equals(h) || h.endsWith(".youtube.com")
+                    || "youtu.be".equals(h) || h.endsWith(".youtu.be")
+                    || "spotify.com".equals(h) || h.endsWith(".spotify.com");
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /**
+     * Decodes percent-encoded octets (%XX) and '+' once without failing on malformed escapes.
+     */
+    private static String decodePercentOnce(String raw) {
+        if (raw == null || raw.isEmpty() || (raw.indexOf('%') < 0 && raw.indexOf('+') < 0)) {
+            return raw;
+        }
+        ByteArrayOutputStream out = new ByteArrayOutputStream(raw.length());
+        int len = raw.length();
+        for (int i = 0; i < len; i++) {
+            char c = raw.charAt(i);
+            if (c == '+') {
+                out.write(' ');
+            } else if (c == '%' && i + 2 < len) {
+                int hi = Character.digit(raw.charAt(i + 1), 16);
+                int lo = Character.digit(raw.charAt(i + 2), 16);
+                if (hi >= 0 && lo >= 0) {
+                    out.write((hi << 4) | lo);
+                    i += 2;
+                } else {
+                    out.write('%');
+                }
+            } else if (c < 0x80) {
+                out.write(c);
+            } else {
+                byte[] utf8 = String.valueOf(c).getBytes(StandardCharsets.UTF_8);
+                out.write(utf8, 0, utf8.length);
+            }
+        }
+        return new String(out.toByteArray(), StandardCharsets.UTF_8);
+    }
+
     private static boolean isTrackingParam(String key, boolean isMediaHost) {
         if (key == null) return false;
-        String lower = key.toLowerCase(Locale.ROOT);
+        String lower = key.trim().toLowerCase(Locale.ROOT);
         if (lower.startsWith("utm_")) {
             return true;
         }
         if (TRACKING_EXACT.contains(lower)) {
             return true;
         }
-        // Scope "si" parameter strictly to YouTube / Spotify share links
+        // Scope "si" parameter strictly to verified YouTube / Spotify hostnames
         if ("si".equals(lower) && isMediaHost) {
             return true;
         }

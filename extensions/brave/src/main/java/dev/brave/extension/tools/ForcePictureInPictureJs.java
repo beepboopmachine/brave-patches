@@ -26,8 +26,9 @@ public final class ForcePictureInPictureJs {
     }
 
     /**
-     * Permanently removes disablepictureinpicture restrictions on all current and future HTML5
-     * <video> elements (including inside Shadow DOM) and overrides HTMLVideoElement.prototype.disablePictureInPicture.
+     * Removes disablepictureinpicture restrictions on all current and future HTML5 <video> elements,
+     * including existing and dynamically attached Shadow DOM roots, and overrides
+     * HTMLVideoElement.prototype.disablePictureInPicture.
      */
     public static String getEnableJs() {
         return "(() => {"
@@ -40,8 +41,21 @@ public final class ForcePictureInPictureJs {
                 + "      configurable: true"
                 + "    });"
                 + "  } catch (e) {}"
+                + "  const observedRoots = (typeof WeakSet !== 'undefined') ? new WeakSet() : null;"
+                + "  let mo = null;"
+                + "  function observeRoot(root) {"
+                + "    if (!root || !mo) return;"
+                + "    if (observedRoots) {"
+                + "      if (observedRoots.has(root)) return;"
+                + "      observedRoots.add(root);"
+                + "    }"
+                + "    try {"
+                + "      mo.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['disablepictureinpicture'] });"
+                + "    } catch (e) {}"
+                + "  }"
                 + "  function unlockVideos(root) {"
                 + "    if (!root || !root.querySelectorAll) return;"
+                + "    if (root.nodeType === 11) observeRoot(root);"
                 + "    const videos = root.querySelectorAll('video');"
                 + "    for (let i = 0; i < videos.length; i++) {"
                 + "      try { videos[i].removeAttribute('disablepictureinpicture'); } catch (e) {}"
@@ -51,9 +65,8 @@ public final class ForcePictureInPictureJs {
                 + "      if (all[i].shadowRoot) unlockVideos(all[i].shadowRoot);"
                 + "    }"
                 + "  }"
-                + "  unlockVideos(document);"
                 + "  try {"
-                + "    const mo = new MutationObserver((mutations) => {"
+                + "    mo = new MutationObserver((mutations) => {"
                 + "      for (const m of mutations) {"
                 + "        if (m.type === 'attributes' && m.target && m.target.tagName === 'VIDEO') {"
                 + "          try { m.target.removeAttribute('disablepictureinpicture'); } catch (e) {}"
@@ -62,18 +75,27 @@ public final class ForcePictureInPictureJs {
                 + "            if (n.nodeType === 1) {"
                 + "              if (n.tagName === 'VIDEO') {"
                 + "                try { n.removeAttribute('disablepictureinpicture'); } catch (e) {}"
-                + "              } else {"
-                + "                unlockVideos(n);"
                 + "              }"
+                + "              if (n.shadowRoot) unlockVideos(n.shadowRoot);"
+                + "              unlockVideos(n);"
                 + "            }"
                 + "          }"
                 + "        }"
                 + "      }"
                 + "    });"
-                + "    mo.observe(document.documentElement || document, {"
-                + "      childList: true, subtree: true, attributes: true, attributeFilter: ['disablepictureinpicture']"
-                + "    });"
+                + "    observeRoot(document.documentElement || document);"
                 + "  } catch (e) {}"
+                + "  try {"
+                + "    const origAttachShadow = Element.prototype.attachShadow;"
+                + "    if (origAttachShadow) {"
+                + "      Element.prototype.attachShadow = function(init) {"
+                + "        const sr = origAttachShadow.apply(this, arguments);"
+                + "        if (sr) unlockVideos(sr);"
+                + "        return sr;"
+                + "      };"
+                + "    }"
+                + "  } catch (e) {}"
+                + "  unlockVideos(document);"
                 + "})();";
     }
 }

@@ -1,8 +1,8 @@
-# Brave v1.100.58 Morphe Patch Suite — Post-Merge QA Verification Checklist
+# Brave v1.100.58 Morphe Patch Suite — Manual QA Verification Checklist
 
-This document specifies the definitive end-to-end verification checklist for validating all 17 Morphe patches targeting **Brave Browser Android `v1.100.58`** (`versionCode: 430005804`).
+This document provides a manual verification checklist for validating the patches in this repository targeting **Brave Browser Android `v1.100.58`** (`versionCode: 430005804`).
 
-All tests are conducted strictly offline against the local QA test server (`http://127.0.0.1:8765/`).
+> **Note**: Helper QA server/fixture scripts are not bundled in this repository. Build the patch bundle via `./gradlew build`, patch a clean Brave v1.100.58 APK with Morphe CLI, install via `adb install`, and verify each scenario below against a local HTTP server (e.g., `http://127.0.0.1:8765/` with `adb reverse tcp:8765 tcp:8765`) or live test pages.
 
 ---
 
@@ -10,11 +10,10 @@ All tests are conducted strictly offline against the local QA test server (`http
 
 | Step | Action | Verification Command | Expected Output | Status |
 |:---|:---|:---|:---|:---|
-| **0.1** | Start QA Test Server | `python tools/qa/test_server.py` | `BRAVE v1.100.58 MORPHE QA TEST SERVER ACTIVE` & `Local Server URL : http://127.0.0.1:8765/` | [ ] PASS / [ ] FAIL |
-| **0.2** | Verify / Generate Fixtures | `python tools/qa/generate_fixtures.py` | `[SUCCESS] All QA test fixtures are ready.` (Includes 30s video, 720p/480p TS, AES-128, fMP4, DRM, WebP) | [ ] PASS / [ ] FAIL |
-| **0.3** | Setup ADB Port Forwarding | `adb reverse tcp:8765 tcp:8765` | Returns exit code 0 | [ ] PASS / [ ] FAIL |
-| **0.4** | Run Deploy & Verify Script | `.\tools\qa\deploy.ps1` | `[PASS]` on AAPT checks (package ID, foregroundServiceType 0x1, 9 providers), APK installed, app launched | [ ] PASS / [ ] FAIL |
-| **0.5** | Navigate to QA Dashboard | Open `http://127.0.0.1:8765/` in Brave Mod | Dark-mode QA dashboard renders completely with 8 test cards | [ ] PASS / [ ] FAIL |
+| **0.1** | Build Patch Bundle | `./gradlew build` | `patches/build/libs/patches-1.0.0.mpp` created, exit code 0 | [ ] PASS / [ ] FAIL |
+| **0.2** | Patch Brave APK | `java -jar morphe-cli.jar patch --patches patches/build/libs/patches-1.0.0.mpp --out brave-patched.apk base.apk` | Patched APK produced with 0 errors | [ ] PASS / [ ] FAIL |
+| **0.3** | Setup Local Test Server (Optional) | `adb reverse tcp:8765 tcp:8765` | Returns exit code 0 | [ ] PASS / [ ] FAIL |
+| **0.4** | Install Patched APK | `adb install -r brave-patched.apk` | `Success` (coexists with official Brave when Clone Package patch is enabled) | [ ] PASS / [ ] FAIL |
 
 ---
 

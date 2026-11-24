@@ -2,6 +2,16 @@ package dev.brave.extension.core;
 
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.content.res.AssetFileDescriptor;
+import android.database.Cursor;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Environment;
+import android.provider.MediaStore;
+import java.io.File;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.Locale;
 
 /**
  * Thread-safe, null-safe preferences storage for Brave Morphe patches.
@@ -81,28 +91,98 @@ public final class PatchPrefs {
         } catch (Throwable ignored) {}
     }
 
-    private static final String PREF_DOWNLOADED_PREFIX = "downloaded_media_";
+    private static final String PREF_DOWNLOADED_PREFIX = "downloaded_media_v2_";
+
+    private static String downloadedKeyForUrl(String url) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] digest = md.digest(url.getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(PREF_DOWNLOADED_PREFIX.length() + 64);
+            sb.append(PREF_DOWNLOADED_PREFIX);
+            for (byte b : digest) {
+                sb.append(String.format(Locale.ROOT, "%02x", b & 0xFF));
+            }
+            return sb.toString();
+        } catch (Throwable ignored) {
+            return PREF_DOWNLOADED_PREFIX + url.length() + "_" + url.hashCode();
+        }
+    }
 
     public static boolean isMediaDownloaded(Context context, String url) {
-        if (url == null || url.isEmpty()) return false;
+        if (context == null || url == null || url.isEmpty()) return false;
         try {
-            String path = getString(context, PREF_DOWNLOADED_PREFIX + url.hashCode(), null);
-            if (path != null && !path.isEmpty()) {
-                if ("done".equals(path)) return true;
-                java.io.File f = new java.io.File(path);
-                if (f.exists() && f.length() > 0) return true;
-                java.io.File fDl = new java.io.File(android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS), path);
-                if (fDl.exists() && fDl.length() > 0) return true;
+            String key = downloadedKeyForUrl(url);
+            String stored = getString(context, key, null);
+            if (stored == null || stored.isEmpty()) return false;
+
+            if (verifyStoredMediaExists(context, stored)) {
                 return true;
+            }
+
+            // Stored file was deleted or never written: prune stale record
+            SharedPreferences sp = get(context);
+            if (sp != null) {
+                sp.edit().remove(key).apply();
             }
         } catch (Throwable ignored) {}
         return false;
     }
 
-    public static void markMediaDownloaded(Context context, String url, String filePath) {
-        if (url == null || url.isEmpty()) return;
+    private static boolean verifyStoredMediaExists(Context context, String stored) {
+        if (stored == null || stored.isEmpty() || "done".equals(stored)) {
+            return false;
+        }
+
+        if (stored.startsWith("content://")) {
+            try (AssetFileDescriptor afd = context.getContentResolver().openAssetFileDescriptor(Uri.parse(stored), "r")) {
+                return afd != null && afd.getLength() != 0;
+            } catch (Throwable ignored) {
+                return false;
+            }
+        }
+
+        File f = new File(stored);
+        if (f.exists() && f.length() > 0) return true;
+
+        File dlDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+        File picDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES);
+        String baseName = f.getName();
+
+        File fDl = new File(dlDir, stored);
+        if (fDl.exists() && fDl.length() > 0) return true;
+        File fDlSub = new File(new File(dlDir, "BraveMedia"), baseName);
+        if (fDlSub.exists() && fDlSub.length() > 0) return true;
+        File fPicSub = new File(new File(picDir, "BraveMedia"), baseName);
+        if (fPicSub.exists() && fPicSub.length() > 0) return true;
+
+        // On Android 10+, also verify via MediaStore (covers Chromium native Downloads)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && baseName != null && !baseName.isEmpty()) {
+            if (existsInMediaStore(context, MediaStore.Downloads.EXTERNAL_CONTENT_URI, baseName)) return true;
+            if (existsInMediaStore(context, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, baseName)) return true;
+        }
+
+        return false;
+    }
+
+    private static boolean existsInMediaStore(Context context, Uri collection, String displayName) {
+        String[] projection = new String[]{MediaStore.MediaColumns._ID, MediaStore.MediaColumns.SIZE};
+        String selection = MediaStore.MediaColumns.DISPLAY_NAME + "=?";
+        try (Cursor c = context.getContentResolver().query(collection, projection, selection, new String[]{displayName}, null)) {
+            if (c != null) {
+                while (c.moveToNext()) {
+                    long size = c.getLong(1);
+                    if (size > 0) return true;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
+    public static void markMediaDownloaded(Context context, String url, String filePathOrUri) {
+        if (context == null || url == null || url.isEmpty()) return;
+        if (filePathOrUri == null || filePathOrUri.isEmpty() || "done".equals(filePathOrUri)) return;
         try {
-            setString(context, PREF_DOWNLOADED_PREFIX + url.hashCode(), filePath != null && !filePath.isEmpty() ? filePath : "done");
+            setString(context, downloadedKeyForUrl(url), filePathOrUri);
         } catch (Throwable ignored) {}
     }
 }

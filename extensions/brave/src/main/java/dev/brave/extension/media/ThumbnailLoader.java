@@ -2,27 +2,26 @@ package dev.brave.extension.media;
 
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
-import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
 import android.util.LruCache;
 import android.view.View;
 import android.widget.ImageView;
-import java.io.ByteArrayOutputStream;
-import java.io.InputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 /**
- * High-performance, memory-capped thumbnail loader with LruCache and sub-sampling.
+ * Memory-capped thumbnail loader with LruCache, SSRF-safe fetching, strict-origin Referer,
+ * and decoded-pixel budget enforcement for extreme aspect ratios.
  */
 public final class ThumbnailLoader {
     private static final String TAG = "Brave_ThumbLoader";
+    private static final int MAX_THUMB_BYTES = 2 * 1024 * 1024; // 2 MB download cap
+    private static final int MAX_DECODE_DIM = 512;
+    private static final long MAX_DECODE_PIXELS = 256L * 256L * 2L; // ~512 KB ARGB_8888 max
+
     private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
-    private static final ExecutorService THREAD_POOL = Executors.newFixedThreadPool(3);
+    private static final ExecutorService THREAD_POOL = NetworkSafety.newBoundedPool(3, 32, "BraveThumbLoader");
 
     private static final LruCache<String, Bitmap> CACHE;
 
@@ -56,66 +55,52 @@ public final class ThumbnailLoader {
             return;
         }
 
-        // Initially show empty / placeholder until loaded
         imageView.setImageDrawable(null);
         imageView.setVisibility(View.VISIBLE);
 
         THREAD_POOL.execute(() -> {
-            HttpURLConnection conn = null;
+            NetworkSafety.SafeConnection sc = null;
             try {
-                URL u = new URL(cleanUrl);
-                conn = (HttpURLConnection) u.openConnection();
-                conn.setRequestMethod("GET");
-                conn.setConnectTimeout(6000);
-                conn.setReadTimeout(6000);
-                conn.setInstanceFollowRedirects(true);
-                conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14; Pixel 6a) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36");
-                if (referer != null && !referer.isEmpty()) {
-                    conn.setRequestProperty("Referer", referer);
-                }
+                sc = NetworkSafety.openSafeConnection(
+                        cleanUrl, "GET", NetworkSafety.DEFAULT_USER_AGENT, "", "",
+                        referer, referer, null, false, 6000, 6000
+                );
+                if (sc.responseCode >= 200 && sc.responseCode < 300) {
+                    byte[] data = NetworkSafety.readBytesBounded(sc.conn.getInputStream(), MAX_THUMB_BYTES);
+                    if (data.length > 0) {
+                        BitmapFactory.Options opts = new BitmapFactory.Options();
+                        opts.inJustDecodeBounds = true;
+                        BitmapFactory.decodeByteArray(data, 0, data.length, opts);
 
-                int code = conn.getResponseCode();
-                if (code >= 200 && code < 300) {
-                    try (InputStream is = conn.getInputStream();
-                         ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
-                        byte[] buf = new byte[4096];
-                        int r;
-                        int total = 0;
-                        while ((r = is.read(buf)) != -1) {
-                            total += r;
-                            if (total > 2 * 1024 * 1024) break; // 2MB cap for thumbnails
-                            baos.write(buf, 0, r);
-                        }
-                        byte[] data = baos.toByteArray();
-                        if (data.length > 0) {
-                            BitmapFactory.Options opts = new BitmapFactory.Options();
-                            opts.inJustDecodeBounds = true;
-                            BitmapFactory.decodeByteArray(data, 0, data.length, opts);
+                        if (opts.outWidth <= 0 || opts.outHeight <= 0) return;
 
-                            opts.inSampleSize = calculateInSampleSize(opts, 240, 160);
-                            opts.inJustDecodeBounds = false;
-                            Bitmap bmp = BitmapFactory.decodeByteArray(data, 0, data.length, opts);
+                        opts.inSampleSize = calculateInSampleSize(opts, 240, 160);
+                        opts.inJustDecodeBounds = false;
+                        Bitmap bmp = BitmapFactory.decodeByteArray(data, 0, data.length, opts);
 
-                            if (bmp != null) {
-                                CACHE.put(cleanUrl, bmp);
-                                MAIN_HANDLER.post(() -> {
-                                    if (cleanUrl.equals(imageView.getTag())) {
-                                        imageView.setImageBitmap(bmp);
-                                        imageView.setVisibility(View.VISIBLE);
-                                    }
-                                });
-                            }
+                        if (bmp != null) {
+                            CACHE.put(cleanUrl, bmp);
+                            MAIN_HANDLER.post(() -> {
+                                if (cleanUrl.equals(imageView.getTag())) {
+                                    imageView.setImageBitmap(bmp);
+                                    imageView.setVisibility(View.VISIBLE);
+                                }
+                            });
                         }
                     }
                 }
             } catch (Throwable t) {
                 Log.d(TAG, "Failed loading thumb: " + cleanUrl, t);
             } finally {
-                if (conn != null) conn.disconnect();
+                if (sc != null && sc.conn != null) sc.conn.disconnect();
             }
         });
     }
 
+    /**
+     * Computes power-of-2 inSampleSize satisfying target dimensions AND hard decoded dimension
+     * and pixel-count budgets so extreme aspect-ratio images (e.g. 40,000x100) cannot OOM.
+     */
     private static int calculateInSampleSize(BitmapFactory.Options options, int reqWidth, int reqHeight) {
         final int height = options.outHeight;
         final int width = options.outWidth;
@@ -128,6 +113,14 @@ public final class ThumbnailLoader {
                 inSampleSize *= 2;
             }
         }
-        return inSampleSize;
+
+        // Enforce decoded dimension & total pixel budget for extreme aspect ratios
+        while ((width / inSampleSize) > MAX_DECODE_DIM
+                || (height / inSampleSize) > MAX_DECODE_DIM
+                || ((long) (width / inSampleSize) * (long) (height / inSampleSize)) > MAX_DECODE_PIXELS) {
+            inSampleSize *= 2;
+        }
+
+        return Math.max(1, inSampleSize);
     }
 }

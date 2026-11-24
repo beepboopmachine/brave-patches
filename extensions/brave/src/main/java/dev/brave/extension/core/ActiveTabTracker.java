@@ -147,20 +147,30 @@ public final class ActiveTabTracker {
 
         postToMain(() -> {
             if (tab != null) {
-                sActiveTabRef = new WeakReference<>(tab);
-                updateCachedTabState(tab);
+                int tId = tab.getId();
+                boolean isActive = isCurrentlyActiveTab(tab, tId);
+                if (sActiveTabRef.get() == null && sActiveTabId < 0) {
+                    sActiveTabRef = new WeakReference<>(tab);
+                    updateCachedTabState(tab);
+                    isActive = true;
+                } else if (isActive) {
+                    updateCachedTabState(tab);
+                }
 
                 String startUrl = "";
                 if (handle != null) {
                     startUrl = getGurlSpec(handle.f);
                     if (startUrl.isEmpty()) startUrl = getGurlSpec(handle.g);
                 }
-                if (startUrl.isEmpty()) startUrl = sActiveTabUrl;
-                Log.i(TAG, "onNavigationStarted: tab=" + tab.getId() + ", url=" + startUrl);
+                if (startUrl.isEmpty()) startUrl = resolveTabUrl(tab);
+                if (isActive && !startUrl.isEmpty()) {
+                    sActiveTabUrl = startUrl;
+                }
+                Log.i(TAG, "onNavigationStarted: tab=" + tId + " (active=" + isActive + "), url=" + startUrl);
 
-                // Immediately advance generation & clear previous page's streams/images
-                int tId = tab.getId();
+                // Immediately advance generation & clear previous page's streams/images for THIS tab only
                 dev.brave.extension.media.IframeStreamResolver.clearTab(tId);
+                dev.brave.extension.media.YouTubeExtractor.clearTab(tId);
                 dev.brave.extension.media.MediaRegistry.advanceGenerationAndClear(tId, startUrl, true);
                 dev.brave.extension.media.MediaBridge.checkAndRegisterDirectMedia(tId, startUrl, "onNavigationStarted");
             }
@@ -188,18 +198,27 @@ public final class ActiveTabTracker {
 
         postToMain(() -> {
             if (tab != null) {
-                sActiveTabRef = new WeakReference<>(tab);
-                updateCachedTabState(tab);
-                Log.i(TAG, "onNavigationFinished: tab=" + tab.getId() + ", url=" + sActiveTabUrl + ", handle=" + (handle != null ? "committed=" + handle.i : "null"));
+                final int tId = tab.getId();
+                boolean isActive = isCurrentlyActiveTab(tab, tId);
+                if (sActiveTabRef.get() == null && sActiveTabId < 0) {
+                    sActiveTabRef = new WeakReference<>(tab);
+                    updateCachedTabState(tab);
+                    isActive = true;
+                } else if (isActive) {
+                    updateCachedTabState(tab);
+                }
 
                 String finishUrl = "";
                 if (handle != null) {
                     finishUrl = getGurlSpec(handle.f);
                     if (finishUrl.isEmpty()) finishUrl = getGurlSpec(handle.g);
                 }
-                if (finishUrl.isEmpty()) finishUrl = sActiveTabUrl;
+                if (finishUrl.isEmpty()) finishUrl = resolveTabUrl(tab);
+                if (isActive && !finishUrl.isEmpty()) {
+                    sActiveTabUrl = finishUrl;
+                }
+                Log.i(TAG, "onNavigationFinished: tab=" + tId + " (active=" + isActive + "), url=" + finishUrl + ", handle=" + (handle != null ? "committed=" + handle.i : "null"));
 
-                final int tId = tab.getId();
                 if (handle != null && handle.i && !handle.k) {
                     // Ensure stale items are cleared if URL changed (e.g. redirect or SPA commit)
                     // WITHOUT clearing items already detected for this exact URL during start
@@ -210,7 +229,7 @@ public final class ActiveTabTracker {
                 dev.brave.extension.media.MediaBridge.checkAndRegisterDirectMedia(tId, finishUrl, "onNavigationFinished");
 
                 if (finishUrl != null && (finishUrl.startsWith("http://") || finishUrl.startsWith("https://"))) {
-                    dev.brave.extension.media.IframeStreamResolver.resolveIframeAsync(finishUrl, "", tId);
+                    dev.brave.extension.media.IframeStreamResolver.resolveIframeAsync(finishUrl, finishUrl, tId);
                 }
 
                 if (tab.getWebContents() != null) {
@@ -235,7 +254,9 @@ public final class ActiveTabTracker {
     public static void onTabDestroyed(final Tab tab) {
         postToMain(() -> {
             if (tab != null) {
-                dev.brave.extension.media.IframeStreamResolver.clearTab(tab.getId());
+                int tId = tab.getId();
+                dev.brave.extension.media.IframeStreamResolver.clearTab(tId);
+                dev.brave.extension.media.YouTubeExtractor.clearTab(tId);
             }
             Tab current = sActiveTabRef.get();
             if (current == tab || (tab != null && tab.getId() == sActiveTabId)) {
@@ -255,23 +276,41 @@ public final class ActiveTabTracker {
         });
     }
 
+    private static boolean isCurrentlyActiveTab(Tab tab, int tabId) {
+        if (tab == null) return false;
+        Tab current = sActiveTabRef.get();
+        if (current != null) {
+            return current == tab || (sActiveTabId >= 0 && tabId == sActiveTabId);
+        }
+        return sActiveTabId >= 0 && tabId == sActiveTabId;
+    }
+
+    public static String resolveTabUrl(Tab tab) {
+        if (tab == null) return "";
+        try {
+            String url = getGurlSpec(tab.getUrl());
+            if ((url == null || url.isEmpty()) && tab.getWebContents() != null) {
+                try {
+                    url = getGurlSpec(tab.getWebContents().C());
+                } catch (Throwable ignored) {}
+                if (url == null || url.isEmpty()) {
+                    try {
+                        url = getGurlSpec(tab.getWebContents().b0());
+                    } catch (Throwable ignored) {}
+                }
+            }
+            return url != null ? url : "";
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
     private static void updateCachedTabState(Tab tab) {
         if (tab != null) {
             try {
                 sActiveTabId = tab.getId();
                 sIsIncognito = tab.isIncognito();
-                String url = getGurlSpec(tab.getUrl());
-                if ((url == null || url.isEmpty()) && tab.getWebContents() != null) {
-                    try {
-                        url = getGurlSpec(tab.getWebContents().C());
-                    } catch (Throwable ignored) {}
-                    if (url == null || url.isEmpty()) {
-                        try {
-                            url = getGurlSpec(tab.getWebContents().b0());
-                        } catch (Throwable ignored) {}
-                    }
-                }
-                sActiveTabUrl = (url != null) ? url : "";
+                sActiveTabUrl = resolveTabUrl(tab);
             } catch (Throwable t) {
                 Log.w(TAG, "Failed reading tab state", t);
             }

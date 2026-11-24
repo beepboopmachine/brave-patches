@@ -9,8 +9,8 @@ Built for **Brave v1.100.58** (`versionCode: 430005804`, Android 8.0+ / API 26+)
 ## Included Patches (22)
 
 ### Media & Downloads
-- **Media & HLS Downloader** — Adds a download button to the top toolbar that sniffs video/audio streams (MP4, WebM, M3U8/HLS, TS, fMP4, embedded iframes) and downloads/remuxes them in the background to MP4 (including AES-128 encrypted streams).
-- **Force Picture-in-Picture** — Strips `disablePictureInPicture` restrictions on HTML5 video elements so PiP always works.
+- **Media & HLS Downloader** — Adds a download button to the top toolbar that sniffs video/audio streams (MP4, WebM, M3U8/HLS, TS, fMP4, embedded iframes, YouTube progressive & adaptive HD MP4+M4A) and downloads/remuxes HLS streams in parallel in the background to MP4 (including AES-128 encrypted streams and alternate audio renditions).
+- **Force Picture-in-Picture** — Strips `disablePictureInPicture` restrictions on HTML5 video elements (including inside Shadow DOM roots) so PiP stays enabled.
 
 ### UI & Usability
 - **AMOLED Black Theme** — Replaces dark-gray dark mode surfaces (`#1F1F1F`) across the browser UI, omnibox, menus, and settings with pure black (`#000000`).
@@ -38,7 +38,7 @@ Built for **Brave v1.100.58** (`versionCode: 430005804`, Android 8.0+ / API 26+)
 
 ### Core & Cloning
 - **Brave Core Infrastructure** — Shared active-tab tracking and navigation lifecycle hooks used by the other patches.
-- **Clone Package & Branding** — Changes the package name (`com.brave.browser.clone`), authorities, and permissions so you can install the patched build alongside official Brave, with custom adaptive icons in `branding/`.
+- **Clone Package & Branding** — Rewrites the manifest package name (`com.brave.browser.clone`), application label, ContentProvider authorities, and custom permissions so you can install the patched build alongside official Brave. Standalone adaptive icon source vectors live in `branding/` (not yet automatically injected into `resources.arsc`).
 
 ---
 
@@ -93,4 +93,4 @@ java -jar morphe-cli.jar patch \
 
 ## License
 
-[GPLv3](https://www.gnu.org/licenses/gpl-3.0.html). Not affiliated with Brave Software, Inc.
+[GPLv3](LICENSE). Not affiliated with Brave Software, Inc.

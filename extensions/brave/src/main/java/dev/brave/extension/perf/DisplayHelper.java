@@ -10,21 +10,32 @@ import java.util.List;
 public class DisplayHelper {
 
     public static void forceMaxRefreshRateForWindow(Window window, List<?> supportedModes) {
+        tryForceMaxRefreshRateForWindow(window, supportedModes);
+    }
+
+    /**
+     * Attempts to apply the maximum supported refresh rate mode matching the active physical
+     * resolution. Returns true if a valid mode was found and applied (or already active),
+     * or false if the caller should fall back to Chromium's original refresh-rate logic.
+     */
+    public static boolean tryForceMaxRefreshRateForWindow(Window window, List<?> supportedModes) {
         if (window == null || supportedModes == null || supportedModes.isEmpty()) {
-            return;
+            return false;
         }
         try {
-            forceMaxRefreshRate(window, window.getAttributes(), supportedModes);
-        } catch (Throwable ignored) {}
+            return forceMaxRefreshRate(window, window.getAttributes(), supportedModes);
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     /**
      * Resolves the active display and applies the maximum available refresh rate mode
      * matching the device's currently active screen resolution.
      */
-    public static void forceMaxRefreshRate(Window window, WindowManager.LayoutParams params, List<?> supportedModes) {
+    public static boolean forceMaxRefreshRate(Window window, WindowManager.LayoutParams params, List<?> supportedModes) {
         if (window == null || params == null || supportedModes == null || supportedModes.isEmpty()) {
-            return;
+            return false;
         }
 
         try {
@@ -73,11 +84,17 @@ public class DisplayHelper {
                 }
             }
 
-            if (bestModeId != 0 && params.preferredDisplayModeId != bestModeId) {
+            if (bestModeId == 0) {
+                return false;
+            }
+            if (params.preferredDisplayModeId != bestModeId) {
                 params.preferredDisplayModeId = bestModeId;
                 window.setAttributes(params);
             }
-        } catch (Throwable ignored) {}
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     /**

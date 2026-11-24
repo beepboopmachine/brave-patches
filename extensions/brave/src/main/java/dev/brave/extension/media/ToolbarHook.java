@@ -12,12 +12,12 @@ import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewParent;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import java.lang.ref.WeakReference;
-import java.util.Iterator;
 import java.util.Map;
 import java.util.WeakHashMap;
 import dev.brave.extension.core.ActiveTabTracker;
@@ -25,14 +25,13 @@ import dev.brave.extension.core.JsInjectionHub;
 
 /**
  * Native toolbar integration hook for Brave Browser.
- * Thread-safe, multi-window aware, dynamically resolves view hierarchy without fragile hardcoded virtual IDs.
+ * Thread-safe, multi-window aware with per-toolbar focus & tint state.
  */
 public final class ToolbarHook {
     private static final String TAG = "Brave_ToolbarHook";
 
     private static final int ID_TOOLBAR_BUTTONS = 0x7f0110f9;
     private static final int ID_TAB_SWITCHER_BUTTON = 0x7f011042;
-    private static final int CUSTOM_BUTTON_TAG_KEY = 0x7f019999;
 
     private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
 
@@ -40,6 +39,8 @@ public final class ToolbarHook {
         final WeakReference<FrameLayout> container;
         final WeakReference<ImageView> icon;
         final WeakReference<TextView> badge;
+        ColorStateList currentTint;
+        boolean isUrlFocused;
 
         ToolbarViewHolder(FrameLayout container, ImageView icon, TextView badge) {
             this.container = new WeakReference<>(container);
@@ -48,10 +49,8 @@ public final class ToolbarHook {
         }
     }
 
-    // Multi-window map: maps each toolbar ViewGroup to its custom button holder
+    // Multi-window map: maps each toolbar ViewGroup to its per-window button holder & state
     private static final Map<ViewGroup, ToolbarViewHolder> TOOLBAR_MAP = new WeakHashMap<>();
-    private static volatile ColorStateList sCurrentTint = null;
-    private static volatile boolean sIsUrlFocused = false;
     private static final java.util.concurrent.atomic.AtomicBoolean sInitialized = new java.util.concurrent.atomic.AtomicBoolean(false);
 
     static {
@@ -63,7 +62,8 @@ public final class ToolbarHook {
             return;
         }
 
-        JsInjectionHub.registerPersistentBridge("BraveMediaBridge", new MediaBridge());
+        // Per-tab, per-origin token-authenticated MediaBridge factory
+        JsInjectionHub.registerPersistentBridgeFactory("BraveMediaBridge", MediaBridge::new);
         JsInjectionHub.registerScript(
                 "media_sniffer",
                 JsInjectionHub.InjectionTiming.ON_NAVIGATION_FINISH,
@@ -73,7 +73,9 @@ public final class ToolbarHook {
         MediaRegistry.addListener((tabId, mediaCount, imageCount) -> {
             int activeId = ActiveTabTracker.getActiveTabId();
             android.util.Log.i(TAG, "Media count changed: tabId=" + tabId + ", activeId=" + activeId + ", count=" + (mediaCount + imageCount));
-            if (activeId < 0 || tabId == activeId || tabId == 0) {
+            if (activeId < 0) {
+                updateBadgeCount(0);
+            } else if (tabId == activeId) {
                 updateBadgeCount(mediaCount + imageCount);
             }
         });
@@ -89,7 +91,6 @@ public final class ToolbarHook {
 
         Runnable attachTask = () -> {
             try {
-                // Dynamically find toolbar buttons parent
                 View tabSwitcher = toolbar.findViewById(ID_TAB_SWITCHER_BUTTON);
                 ViewGroup buttonsContainer = null;
                 if (tabSwitcher != null && tabSwitcher.getParent() instanceof ViewGroup) {
@@ -102,7 +103,6 @@ public final class ToolbarHook {
                     buttonsContainer = toolbar;
                 }
 
-                // Check if button already exists in this toolbar
                 View existing = buttonsContainer.findViewWithTag("brave_media_download_button");
                 if (existing != null) {
                     return;
@@ -114,7 +114,7 @@ public final class ToolbarHook {
                 if (customButton == null) return;
 
                 customButton.setTag("brave_media_download_button");
-                customButton.setVisibility(sIsUrlFocused ? View.GONE : View.VISIBLE);
+                customButton.setVisibility(holder.isUrlFocused ? View.GONE : View.VISIBLE);
 
                 int targetIndex = (tabSwitcher != null) ? buttonsContainer.indexOfChild(tabSwitcher) : -1;
                 if (targetIndex >= 0) {
@@ -125,17 +125,10 @@ public final class ToolbarHook {
 
                 TOOLBAR_MAP.put(toolbar, holder);
 
-                if (sCurrentTint != null) {
-                    ImageView icon = holder.icon.get();
-                    if (icon != null) {
-                        icon.setImageTintList(sCurrentTint);
-                    }
-                }
-
                 int activeTabId = ActiveTabTracker.getActiveTabId();
                 if (activeTabId >= 0) {
                     int totalCount = MediaRegistry.getMediaCount(activeTabId) + MediaRegistry.getImageCount(activeTabId);
-                    updateBadgeCount(totalCount);
+                    updateBadgeCountForHolder(holder, totalCount);
                 }
 
             } catch (Throwable t) {
@@ -152,10 +145,6 @@ public final class ToolbarHook {
 
     /**
      * Called from ToolbarPhone.dispatchDraw(Canvas)V during GPU texture snapshot capture.
-     * Note: At the hook site (inside ToolbarPhone.dispatchDraw), the Canvas is ALREADY translated
-     * into ToolbarPhone.I0 (mToolbarButtonsContainer)'s coordinate space! Translating relative
-     * to our button's parent container draws our download button + badge at its exact pixel
-     * position inside Chromium's composited toolbar bitmap (zero pop-in on scroll reveal).
      */
     public static void drawCustomButtonForSnapshot(final ViewGroup toolbar, final android.graphics.Canvas canvas) {
         if (toolbar == null || canvas == null) return;
@@ -178,7 +167,7 @@ public final class ToolbarHook {
             while (current != null && current != buttonsContainer && current != toolbar && guard < 8) {
                 dx += current.getLeft() + current.getTranslationX();
                 dy += current.getTop() + current.getTranslationY();
-                android.view.ViewParent parent = current.getParent();
+                ViewParent parent = current.getParent();
                 if (parent instanceof View) {
                     current = (View) parent;
                 } else {
@@ -195,15 +184,20 @@ public final class ToolbarHook {
     }
 
     /**
-     * Called from ToggleTabStackButton.i(I)V after ColorStateList is resolved.
+     * Per-window tint update called from ToggleTabStackButton.i(I)V with anchor view.
      */
-    public static void onTintChanged(final ColorStateList tint) {
-        sCurrentTint = tint;
+    public static void onTintChanged(final View anchorView, final ColorStateList tint) {
+        if (tint == null) return;
         Runnable task = () -> {
-            for (ToolbarViewHolder holder : TOOLBAR_MAP.values()) {
-                ImageView icon = holder.icon.get();
-                if (icon != null && tint != null) {
-                    icon.setImageTintList(tint);
+            ToolbarViewHolder target = findHolderForDescendant(anchorView);
+            if (target != null) {
+                applyTintToHolder(target, tint);
+            } else {
+                // Fallback if view not yet attached to a tracked toolbar
+                for (ToolbarViewHolder holder : TOOLBAR_MAP.values()) {
+                    if (holder.currentTint == null) {
+                        applyTintToHolder(holder, tint);
+                    }
                 }
             }
         };
@@ -215,37 +209,56 @@ public final class ToolbarHook {
     }
 
     /**
-     * Called from ToolbarPhone.d3(Z)V on Omnibox focus animation.
+     * Fallback single-arg tint callback (used only if register count prevents passing anchor view).
      */
-    public static void onUrlFocusChanged(final boolean isFocused) {
-        sIsUrlFocused = isFocused;
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            applyUrlFocus(isFocused);
-        } else {
-            MAIN_HANDLER.post(() -> applyUrlFocus(isFocused));
-        }
-    }
-
-    private static void applyUrlFocus(boolean isFocused) {
-        for (ToolbarViewHolder holder : TOOLBAR_MAP.values()) {
-            FrameLayout btn = holder.container.get();
-            if (btn != null) {
-                btn.setVisibility(isFocused ? View.GONE : View.VISIBLE);
-            }
-        }
-    }
-
-    public static void updateBadgeCount(final int count) {
+    public static void onTintChanged(final ColorStateList tint) {
+        if (tint == null) return;
         Runnable task = () -> {
             for (ToolbarViewHolder holder : TOOLBAR_MAP.values()) {
-                TextView badge = holder.badge.get();
-                if (badge != null) {
-                    if (count > 0) {
-                        badge.setText(count > 99 ? "99+" : String.valueOf(count));
-                        badge.setVisibility(View.VISIBLE);
-                    } else {
-                        badge.setVisibility(View.GONE);
-                    }
+                applyTintToHolder(holder, tint);
+            }
+        };
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            task.run();
+        } else {
+            MAIN_HANDLER.post(task);
+        }
+    }
+
+    private static void applyTintToHolder(ToolbarViewHolder holder, ColorStateList tint) {
+        holder.currentTint = tint;
+        ImageView icon = holder.icon.get();
+        if (icon != null) {
+            icon.setImageTintList(tint);
+        }
+    }
+
+    private static ToolbarViewHolder findHolderForDescendant(View view) {
+        View current = view;
+        int guard = 0;
+        while (current != null && guard < 16) {
+            if (current instanceof ViewGroup) {
+                ToolbarViewHolder holder = TOOLBAR_MAP.get(current);
+                if (holder != null) return holder;
+            }
+            ViewParent parent = current.getParent();
+            current = (parent instanceof View) ? (View) parent : null;
+            guard++;
+        }
+        return null;
+    }
+
+    /**
+     * Per-window URL focus toggle called from ToolbarPhone.d3(Z)V with owning toolbar.
+     */
+    public static void onUrlFocusChanged(final ViewGroup toolbar, final boolean isFocused) {
+        Runnable task = () -> {
+            ToolbarViewHolder holder = (toolbar != null) ? TOOLBAR_MAP.get(toolbar) : null;
+            if (holder != null) {
+                holder.isUrlFocused = isFocused;
+                FrameLayout btn = holder.container.get();
+                if (btn != null) {
+                    btn.setVisibility(isFocused ? View.GONE : View.VISIBLE);
                 }
             }
         };
@@ -253,6 +266,51 @@ public final class ToolbarHook {
             task.run();
         } else {
             MAIN_HANDLER.post(task);
+        }
+    }
+
+    /**
+     * Legacy fallback single-arg URL focus toggle.
+     */
+    public static void onUrlFocusChanged(final boolean isFocused) {
+        Runnable task = () -> {
+            for (ToolbarViewHolder holder : TOOLBAR_MAP.values()) {
+                holder.isUrlFocused = isFocused;
+                FrameLayout btn = holder.container.get();
+                if (btn != null) {
+                    btn.setVisibility(isFocused ? View.GONE : View.VISIBLE);
+                }
+            }
+        };
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            task.run();
+        } else {
+            MAIN_HANDLER.post(task);
+        }
+    }
+
+    public static void updateBadgeCount(final int count) {
+        Runnable task = () -> {
+            for (ToolbarViewHolder holder : TOOLBAR_MAP.values()) {
+                updateBadgeCountForHolder(holder, count);
+            }
+        };
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            task.run();
+        } else {
+            MAIN_HANDLER.post(task);
+        }
+    }
+
+    private static void updateBadgeCountForHolder(ToolbarViewHolder holder, int count) {
+        TextView badge = holder.badge.get();
+        if (badge != null) {
+            if (count > 0) {
+                badge.setText(count > 99 ? "99+" : String.valueOf(count));
+                badge.setVisibility(View.VISIBLE);
+            } else {
+                badge.setVisibility(View.GONE);
+            }
         }
     }
 

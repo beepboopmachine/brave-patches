@@ -6,22 +6,28 @@ import java.util.List;
 import java.util.Objects;
 
 public class MediaItem implements Serializable {
-    private static final long serialVersionUID = 1L;
+    private static final long serialVersionUID = 2L;
 
     public static class HlsVariant implements Serializable, Comparable<HlsVariant> {
-        private static final long serialVersionUID = 1L;
+        private static final long serialVersionUID = 2L;
         public final String url;
         public final int bandwidth;
         public final int width;
         public final int height;
         public final String codecs;
+        public final String audioPlaylistUrl;
 
         public HlsVariant(String url, int bandwidth, int width, int height, String codecs) {
+            this(url, bandwidth, width, height, codecs, "");
+        }
+
+        public HlsVariant(String url, int bandwidth, int width, int height, String codecs, String audioPlaylistUrl) {
             this.url = url;
             this.bandwidth = bandwidth;
             this.width = width;
             this.height = height;
             this.codecs = codecs != null ? codecs : "";
+            this.audioPlaylistUrl = audioPlaylistUrl != null ? audioPlaylistUrl : "";
         }
 
         public String getResolutionLabel() {
@@ -53,9 +59,12 @@ public class MediaItem implements Serializable {
     public volatile int width;
     public volatile int height;
     public volatile long durationMs;
-    public final String userAgent;
-    public final String cookie;
-    public final String referer;
+    public volatile String userAgent;
+    public volatile String cookie;
+    public volatile String referer;
+    public volatile String cookieSourceUrl = "";
+    public volatile String pageUrl = "";
+    public volatile String trackingUrl = "";
     public final int tabId;
     public final long timestamp;
     public volatile String thumbnailUrl;
@@ -110,6 +119,9 @@ public class MediaItem implements Serializable {
         this.userAgent = userAgent != null ? userAgent : "";
         this.cookie = cookie != null ? cookie : "";
         this.referer = referer != null ? referer : "";
+        this.cookieSourceUrl = this.referer;
+        this.pageUrl = this.referer;
+        this.trackingUrl = this.url;
         this.tabId = tabId;
         this.thumbnailUrl = (thumbnailUrl != null && !thumbnailUrl.trim().isEmpty()) ? thumbnailUrl.trim() : (this.type == MediaType.IMAGE ? this.url : "");
         this.qualityLabel = qualityLabel != null ? qualityLabel.trim() : "";
@@ -137,6 +149,40 @@ public class MediaItem implements Serializable {
             }
         }
         if (quality != null && !quality.trim().isEmpty()) this.qualityLabel = quality.trim();
+    }
+
+    /**
+     * Merges all enriched metadata, authentication context, audio track URL, and HLS variants
+     * from a richer duplicate entry into this canonical item.
+     */
+    public synchronized void mergeFrom(MediaItem other) {
+        if (other == null || other == this) return;
+        updateEnrichedMetadata(other.title, other.mimeType, other.width, other.height,
+                other.sizeBytes, other.durationMs, other.thumbnailUrl, other.qualityLabel);
+
+        if ((this.userAgent == null || this.userAgent.isEmpty()) && other.userAgent != null && !other.userAgent.isEmpty()) {
+            this.userAgent = other.userAgent;
+        }
+        if ((this.cookie == null || this.cookie.isEmpty()) && other.cookie != null && !other.cookie.isEmpty()) {
+            this.cookie = other.cookie;
+            if (other.cookieSourceUrl != null && !other.cookieSourceUrl.isEmpty()) {
+                this.cookieSourceUrl = other.cookieSourceUrl;
+            }
+        }
+        if ((this.referer == null || this.referer.isEmpty() || this.referer.equals(this.url))
+                && other.referer != null && !other.referer.isEmpty() && !other.referer.equals(this.url)) {
+            this.referer = other.referer;
+        }
+        if ((this.pageUrl == null || this.pageUrl.isEmpty() || this.pageUrl.equals(this.url))
+                && other.pageUrl != null && !other.pageUrl.isEmpty()) {
+            this.pageUrl = other.pageUrl;
+        }
+        if ((this.audioUrl == null || this.audioUrl.isEmpty()) && other.audioUrl != null && !other.audioUrl.isEmpty()) {
+            this.audioUrl = other.audioUrl;
+        }
+        if (this.variants.isEmpty() && !other.variants.isEmpty()) {
+            this.variants.addAll(other.variants);
+        }
     }
 
     public String getQualityLabel() {

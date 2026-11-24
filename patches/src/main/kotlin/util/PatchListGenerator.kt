@@ -9,6 +9,7 @@ import app.morphe.patcher.patch.loadPatchesFromJar
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonObject
 import java.io.File
+import java.util.Properties
 import java.util.jar.JarFile
 
 fun main() {
@@ -26,10 +27,10 @@ fun main() {
 
     val expectedVersion = File("../gradle.properties")
         .takeIf { it.exists() }
-        ?.readLines()
-        ?.firstOrNull { it.trim().startsWith("version=") }
-        ?.substringAfter("version=")
-        ?.trim()
+        ?.inputStream()
+        ?.use { input ->
+            Properties().apply { load(input) }.getProperty("version")?.trim()
+        }
 
     val selectedBundle = if (candidates.size == 1) {
         candidates.first()

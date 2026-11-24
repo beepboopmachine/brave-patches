@@ -8,7 +8,7 @@ public final class ForceCopyPasteJs {
     private ForceCopyPasteJs() {}
 
     /**
-     * Registers Force Copy/Paste into JsInjectionHub so it runs automatically on every page
+     * Registers Force Copy/Paste into JsInjectionHub so it runs automatically on committed pages
      * whenever the Force Copy/Paste Morphe patch is enabled.
      */
     public static void ensureRegistered() {
@@ -26,9 +26,12 @@ public final class ForceCopyPasteJs {
     }
 
     /**
-     * Unblocks text selection, copy, cut, paste, and context menus.
-     * Hooks capture phase strictly on window (stopping propagation before document/elements).
-     * Clears both document and document.body inline blocking handlers.
+     * Best-effort unblocking of text selection, copy, cut, paste, and context menus:
+     * - Injects user-select: text CSS rule
+     * - Registers window capture-phase stopImmediatePropagation() handler
+     * - Strips inline on* properties and attributes on window, document, body, and event targets
+     * Note: Because injection runs at navigation finish, capture listeners already registered
+     * directly on window before injection cannot be retroactively removed.
      */
     public static String getEnableJs() {
         return "(() => {"
@@ -40,28 +43,28 @@ public final class ForceCopyPasteJs {
                 + "    st.textContent = '* { -webkit-user-select: text !important; -moz-user-select: text !important; user-select: text !important; -webkit-touch-callout: default !important; }';"
                 + "    (document.head || document.documentElement).appendChild(st);"
                 + "  }"
-                + ""
                 + "  const events = ['copy', 'cut', 'paste', 'selectstart', 'contextmenu', 'dragstart'];"
+                + "  function clearInline(el) {"
+                + "    if (!el) return;"
+                + "    for (let i = 0; i < events.length; i++) {"
+                + "      const prop = 'on' + events[i];"
+                + "      try { if (el[prop]) el[prop] = null; } catch (e) {}"
+                + "      try { if (el.removeAttribute) el.removeAttribute(prop); } catch (e) {}"
+                + "    }"
+                + "  }"
                 + "  if (!window._brave_unblock_handler) {"
-                + "    window._brave_unblock_handler = function(e) { e.stopPropagation(); };"
+                + "    window._brave_unblock_handler = function(e) {"
+                + "      clearInline(e.target);"
+                + "      e.stopImmediatePropagation();"
+                + "    };"
                 + "    events.forEach(evt => {"
                 + "      window.addEventListener(evt, window._brave_unblock_handler, true);"
                 + "    });"
                 + "  }"
-                + "  try {"
-                + "    document.oncopy = null;"
-                + "    document.oncut = null;"
-                + "    document.onpaste = null;"
-                + "    document.oncontextmenu = null;"
-                + "    document.onselectstart = null;"
-                + "    if (document.body) {"
-                + "      document.body.oncopy = null;"
-                + "      document.body.oncut = null;"
-                + "      document.body.onpaste = null;"
-                + "      document.body.oncontextmenu = null;"
-                + "      document.body.onselectstart = null;"
-                + "    }"
-                + "  } catch (ignored) {}"
+                + "  clearInline(window);"
+                + "  clearInline(document);"
+                + "  clearInline(document.documentElement);"
+                + "  clearInline(document.body);"
                 + "})();";
     }
 }

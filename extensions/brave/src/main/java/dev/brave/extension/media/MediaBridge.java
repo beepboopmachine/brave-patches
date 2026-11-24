@@ -3,35 +3,82 @@ package dev.brave.extension.media;
 import android.net.Uri;
 import android.util.Log;
 import android.webkit.JavascriptInterface;
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.net.HttpURLConnection;
-import java.net.URL;
+import dev.brave.extension.core.ActiveTabTracker;
+import java.lang.ref.WeakReference;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import org.chromium.content_public.browser.WebContents;
 import org.json.JSONObject;
-import dev.brave.extension.core.ActiveTabTracker;
 
 /**
- * @JavascriptInterface bridge exposed as window.BraveMediaBridge to page contexts.
- * Supports all non-DRM video, audio, HLS, GIF/animation, and image formats,
- * including local HTTP (127.0.0.1 / LAN) streams, with per-tab generation guards
- * and cross-domain cookie isolation.
+ * Per-tab @JavascriptInterface bridge bound strictly to a single (tabId, WebContents, origin, token).
+ * Validates caller token, originating frame origin, SSRF boundaries, scheme-safe cookie isolation,
+ * strict-origin-when-cross-origin referrers, and per-tab capacity before scheduling native work.
  */
 public class MediaBridge {
     private static final String TAG = "Brave_MediaBridge";
-    private static final int MAX_PLAYLIST_BYTES = 1024 * 1024; // 1 MB cap
-    private static final ExecutorService PARSER_POOL = Executors.newFixedThreadPool(2);
+    private static final int MAX_PLAYLIST_CHARS = 1024 * 1024; // 1 MB cap
+    private static final int MAX_JSON_PAYLOAD_CHARS = 64 * 1024; // 64 KB cap
+    private static final ExecutorService PARSER_POOL = NetworkSafety.newBoundedPool(2, 32, "BraveHlsParser");
+
+    private final int mBoundTabId;
+    private final WeakReference<WebContents> mWebContentsRef;
+    private final String mBoundOrigin;
+    private final String mBridgeToken;
+
+    public MediaBridge() {
+        this(-1, null, "", "");
+    }
+
+    public MediaBridge(int boundTabId, WebContents webContents, String boundOrigin, String bridgeToken) {
+        this.mBoundTabId = boundTabId;
+        this.mWebContentsRef = new WeakReference<>(webContents);
+        this.mBoundOrigin = boundOrigin != null ? boundOrigin : "";
+        this.mBridgeToken = bridgeToken != null ? bridgeToken : "";
+    }
+
+    private boolean isAuthorized(String token) {
+        if (mBridgeToken.isEmpty()) {
+            return false; // Require token-bound bridge instance
+        }
+        if (token == null || token.isEmpty()) {
+            return false;
+        }
+        if (mWebContentsRef.get() == null) {
+            return false;
+        }
+        return MessageDigest.isEqual(
+                mBridgeToken.getBytes(StandardCharsets.UTF_8),
+                token.getBytes(StandardCharsets.UTF_8)
+        );
+    }
+
+    private int resolveBoundTabId() {
+        if (mBoundTabId >= 0) return mBoundTabId;
+        int tabId = ActiveTabTracker.getActiveTabId();
+        return tabId >= 0 ? tabId : 0;
+    }
 
     @JavascriptInterface
-    public void onPageUrlChanged(String newUrl) {
+    public void onPageUrlChanged(String token, String newUrl) {
+        if (!isAuthorized(token)) {
+            Log.w(TAG, "Rejected unauthorized onPageUrlChanged call");
+            return;
+        }
         if (newUrl == null || newUrl.isEmpty()) return;
-        int tabId = resolveActiveTabId();
+        // An SPA history change must stay within this bridge's bound origin
+        if (!mBoundOrigin.isEmpty() && !NetworkSafety.isSameOrigin(mBoundOrigin, newUrl)) {
+            Log.w(TAG, "Rejected cross-origin onPageUrlChanged: " + newUrl + " (bound=" + mBoundOrigin + ")");
+            return;
+        }
+        int tabId = resolveBoundTabId();
         Log.i(TAG, "SPA/Page URL changed on tab " + tabId + ": " + newUrl);
         IframeStreamResolver.clearTab(tabId);
+        YouTubeExtractor.clearTab(tabId);
         MediaRegistry.advanceGenerationAndClear(tabId, newUrl, false);
         if (YouTubeExtractor.isYouTubeUrl(newUrl)) {
             YouTubeExtractor.resolveAsync(tabId, newUrl);
@@ -39,16 +86,32 @@ public class MediaBridge {
     }
 
     @JavascriptInterface
-    public void onIframeDetected(String iframeUrl, String pageUrl) {
+    public void onIframeDetected(String token, String iframeUrl, String pageUrl) {
+        if (!isAuthorized(token)) {
+            Log.w(TAG, "Rejected unauthorized onIframeDetected call");
+            return;
+        }
         if (iframeUrl == null || iframeUrl.isEmpty()) return;
-        int tabId = resolveActiveTabId();
-        Log.i(TAG, "onIframeDetected: " + iframeUrl + " (referer=" + pageUrl + ", tab=" + tabId + ")");
-        IframeStreamResolver.resolveIframeAsync(iframeUrl, pageUrl, tabId);
+        String effectivePage = (pageUrl != null && !pageUrl.isEmpty() && NetworkSafety.isSameOrigin(mBoundOrigin, pageUrl))
+                ? pageUrl : mBoundOrigin;
+        int tabId = resolveBoundTabId();
+        if (!MediaRegistry.canAcceptMedia(tabId, MediaType.VIDEO)) {
+            return;
+        }
+        if (!NetworkSafety.isAllowedTargetUrl(iframeUrl, effectivePage)) {
+            return;
+        }
+        Log.i(TAG, "onIframeDetected: " + iframeUrl + " (page=" + effectivePage + ", tab=" + tabId + ")");
+        IframeStreamResolver.resolveIframeAsync(iframeUrl, effectivePage, tabId);
     }
 
     @JavascriptInterface
-    public void onMediaFound(String jsonString) {
-        if (jsonString == null || jsonString.isEmpty()) return;
+    public void onMediaFound(String token, String jsonString) {
+        if (!isAuthorized(token)) {
+            Log.w(TAG, "Rejected unauthorized onMediaFound call");
+            return;
+        }
+        if (jsonString == null || jsonString.isEmpty() || jsonString.length() > MAX_JSON_PAYLOAD_CHARS) return;
 
         try {
             JSONObject obj = new JSONObject(jsonString);
@@ -64,27 +127,13 @@ public class MediaBridge {
                 return;
             }
 
-            Uri parsedUri = Uri.parse(url);
-            String rawHost = parsedUri.getHost();
-            if (rawHost == null || rawHost.isEmpty()) {
-                return;
-            }
-            String cleanHost = rawHost.toLowerCase(Locale.ROOT);
-            if (cleanHost.startsWith("[") && cleanHost.endsWith("]")) {
-                cleanHost = cleanHost.substring(1, cleanHost.length() - 1);
-            }
+            String rawReferer = obj.optString("referer", "").trim();
+            String effectivePageUrl = (!rawReferer.isEmpty() && NetworkSafety.isSameOrigin(mBoundOrigin, rawReferer))
+                    ? rawReferer
+                    : mBoundOrigin;
 
-            // Cookie isolation: do not leak first-party cookies to cross-domain CDNs
-            String referer = obj.optString("referer", "");
-            String cookie = obj.optString("cookie", "");
-            if (referer.isEmpty()) {
-                cookie = "";
-            } else {
-                Uri refererUri = Uri.parse(referer);
-                String refHost = refererUri.getHost();
-                if (refHost == null || !refHost.equalsIgnoreCase(cleanHost)) {
-                    cookie = "";
-                }
+            if (!NetworkSafety.isAllowedTargetUrl(url, effectivePageUrl)) {
+                return;
             }
 
             String typeStr = obj.optString("type", "VIDEO").toUpperCase(Locale.ROOT);
@@ -101,28 +150,48 @@ public class MediaBridge {
             if (quality.isEmpty()) quality = obj.optString("res", "");
 
             MediaType type = classifyMediaType(urlLower, typeStr, mimeType);
-            final int capturedTabId = resolveActiveTabId();
+            final int capturedTabId = resolveBoundTabId();
+            if (!MediaRegistry.canAcceptMedia(capturedTabId, type)) {
+                return;
+            }
+
+            // Apply strict-origin-when-cross-origin Referer and scheme+host Cookie isolation
+            String safeReferer = NetworkSafety.computeSafeReferer(effectivePageUrl, url);
+            String rawCookie = obj.optString("cookie", "");
+            String safeCookie = NetworkSafety.computeSafeCookie(rawCookie, effectivePageUrl, url);
+
             final long capturedGen = MediaRegistry.getTabGeneration(capturedTabId);
 
             Log.i(TAG, "onMediaFound: " + type + " -> " + url + " (tab=" + capturedTabId + ", gen=" + capturedGen + ", quality=" + quality + ")");
 
             final MediaItem item = new MediaItem(
                     url, type, url, title, mimeType, size, width, height, duration,
-                    userAgent, cookie, referer, capturedTabId, thumbnail, quality
+                    userAgent, safeCookie, safeReferer, capturedTabId, thumbnail, quality
             );
+            item.cookieSourceUrl = safeCookie.isEmpty() ? "" : effectivePageUrl;
+            item.pageUrl = effectivePageUrl;
 
             if (type == MediaType.HLS_STREAM) {
                 PARSER_POOL.execute(() -> {
                     if (capturedGen != MediaRegistry.getTabGeneration(capturedTabId)) return;
+                    if (!MediaRegistry.canAcceptMedia(capturedTabId, MediaType.HLS_STREAM)) return;
                     try {
-                        String playlistContent = fetchUrlContent(item.url, item.userAgent, item.cookie, item.referer);
-                        if (playlistContent != null && !playlistContent.isEmpty()) {
+                        NetworkSafety.TextFetchResult res = NetworkSafety.fetchTextSafe(
+                                item.url, item.userAgent, item.cookie, item.cookieSourceUrl,
+                                item.pageUrl, item.pageUrl, MAX_PLAYLIST_CHARS, 8000
+                        );
+                        if (res != null && res.body != null && !res.body.isEmpty()) {
+                            String playlistContent = res.body;
                             if (playlistContent.contains("#EXT-X-KEY:") &&
                                     (playlistContent.contains("SAMPLE-AES") || playlistContent.contains("KEYFORMAT=\"urn:uuid:"))) {
                                 Log.i(TAG, "Ignoring DRM-protected HLS stream: " + item.url);
                                 return;
                             }
-                            List<MediaItem.HlsVariant> variants = HlsParser.parseMasterPlaylist(item.url, playlistContent);
+                            if (HlsParser.isIFramesOnlyPlaylist(playlistContent)) {
+                                Log.i(TAG, "Ignoring I-frames-only HLS playlist: " + item.url);
+                                return;
+                            }
+                            List<MediaItem.HlsVariant> variants = HlsParser.parseMasterPlaylist(res.finalUrl, playlistContent);
                             Collections.sort(variants);
                             item.variants.addAll(variants);
                         }
@@ -132,8 +201,8 @@ public class MediaBridge {
                     MediaRegistry.addMediaItem(capturedTabId, capturedGen, item);
                 });
             } else {
-                MediaRegistry.addMediaItem(capturedTabId, capturedGen, item);
-                if (type == MediaType.VIDEO && item.sizeBytes <= 0) {
+                boolean added = MediaRegistry.addMediaItem(capturedTabId, capturedGen, item);
+                if (added && type == MediaType.VIDEO && item.sizeBytes <= 0) {
                     IframeStreamResolver.probeContentLengthAsync(item);
                 }
             }
@@ -162,56 +231,6 @@ public class MediaBridge {
             return "VIDEO".equals(typeStr) ? MediaType.VIDEO : MediaType.IMAGE;
         }
         return MediaType.VIDEO;
-    }
-
-    private static int resolveActiveTabId() {
-        int tabId = ActiveTabTracker.getActiveTabId();
-        if (tabId < 0) {
-            org.chromium.chrome.browser.tab.Tab tab = ActiveTabTracker.getActiveTab();
-            if (tab != null) {
-                try {
-                    tabId = tab.getId();
-                } catch (Throwable ignored) {}
-            }
-        }
-        return tabId >= 0 ? tabId : 0;
-    }
-
-    private static String fetchUrlContent(String urlStr, String userAgent, String cookie, String referer) {
-        HttpURLConnection conn = null;
-        try {
-            URL u = new URL(urlStr);
-            conn = (HttpURLConnection) u.openConnection();
-            conn.setRequestMethod("GET");
-            conn.setConnectTimeout(8000);
-            conn.setReadTimeout(8000);
-            conn.setInstanceFollowRedirects(true);
-            if (userAgent != null && !userAgent.isEmpty()) conn.setRequestProperty("User-Agent", userAgent);
-            if (cookie != null && !cookie.isEmpty()) conn.setRequestProperty("Cookie", cookie);
-            if (referer != null && !referer.isEmpty()) conn.setRequestProperty("Referer", referer);
-
-            int code = conn.getResponseCode();
-            if (code >= 200 && code < 300) {
-                try (BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream(), "UTF-8"))) {
-                    StringBuilder sb = new StringBuilder();
-                    char[] buf = new char[4096];
-                    int r;
-                    int total = 0;
-                    while ((r = reader.read(buf)) != -1) {
-                        total += r;
-                        if (total > MAX_PLAYLIST_BYTES) break;
-                        sb.append(buf, 0, r);
-                    }
-                    return sb.toString();
-                }
-            }
-        } catch (Throwable ignored) {
-        } finally {
-            if (conn != null) {
-                conn.disconnect();
-            }
-        }
-        return null;
     }
 
     public static void checkAndRegisterDirectMedia(int tabId, String url, String stage) {
@@ -245,6 +264,7 @@ public class MediaBridge {
 
         if (type != null) {
             final int targetTab = tabId >= 0 ? tabId : 0;
+            if (!MediaRegistry.canAcceptMedia(targetTab, type)) return;
             final long capturedGen = MediaRegistry.getTabGeneration(targetTab);
             Log.i(TAG, "Direct media detected during " + stage + ": tab=" + targetTab + ", " + type + " -> " + url);
             String title = extractTitleFromUrl(url);
@@ -252,18 +272,29 @@ public class MediaBridge {
                     url, type, url, title, "", 0, 0, 0, 0,
                     "", "", url, targetTab
             );
+            item.pageUrl = url;
+            item.cookieSourceUrl = "";
             if (type == MediaType.HLS_STREAM) {
                 PARSER_POOL.execute(() -> {
                     if (capturedGen != MediaRegistry.getTabGeneration(targetTab)) return;
+                    if (!MediaRegistry.canAcceptMedia(targetTab, MediaType.HLS_STREAM)) return;
                     try {
-                        String playlistContent = fetchUrlContent(item.url, item.userAgent, item.cookie, item.referer);
-                        if (playlistContent != null && !playlistContent.isEmpty()) {
+                        NetworkSafety.TextFetchResult res = NetworkSafety.fetchTextSafe(
+                                item.url, item.userAgent, item.cookie, item.cookieSourceUrl,
+                                item.pageUrl, item.pageUrl, MAX_PLAYLIST_CHARS, 8000
+                        );
+                        if (res != null && res.body != null && !res.body.isEmpty()) {
+                            String playlistContent = res.body;
                             if (playlistContent.contains("#EXT-X-KEY:") &&
                                     (playlistContent.contains("SAMPLE-AES") || playlistContent.contains("KEYFORMAT=\"urn:uuid:"))) {
                                 Log.i(TAG, "Ignoring DRM-protected HLS stream: " + item.url);
                                 return;
                             }
-                            List<MediaItem.HlsVariant> variants = HlsParser.parseMasterPlaylist(item.url, playlistContent);
+                            if (HlsParser.isIFramesOnlyPlaylist(playlistContent)) {
+                                Log.i(TAG, "Ignoring I-frames-only HLS playlist: " + item.url);
+                                return;
+                            }
+                            List<MediaItem.HlsVariant> variants = HlsParser.parseMasterPlaylist(res.finalUrl, playlistContent);
                             Collections.sort(variants);
                             item.variants.addAll(variants);
                         }

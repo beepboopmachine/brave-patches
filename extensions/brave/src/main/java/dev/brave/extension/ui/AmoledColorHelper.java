@@ -90,13 +90,18 @@ public class AmoledColorHelper {
                 return (alpha << 24) | 0x121214;
 
             default:
+                // Only apply broad dark-surface fallback to fully opaque colors so semi-transparent
+                // dividers, scrims, and secondary overlays preserve their intended contrast.
+                if (alpha != 0xFF) {
+                    return color;
+                }
                 int r = (rgb >> 16) & 0xFF;
                 int g = (rgb >> 8) & 0xFF;
                 int b = rgb & 0xFF;
                 int max = Math.max(r, Math.max(g, b));
                 int min = Math.min(r, Math.min(g, b));
                 int spread = max - min;
-                // Catch all Brave dark charcoal & blue-gray surface shades (while preserving vivid brand accents)
+                // Catch Brave dark charcoal & blue-gray surface shades (while preserving vivid brand accents)
                 if (max <= 0x26 && spread <= 16) {
                     return (alpha << 24) | 0x000000;
                 }

@@ -14,12 +14,40 @@ internal object P3aSerializationFingerprint : Fingerprint(
     parameters = listOf("Lmt6;")
 )
 
-internal object UmaSessionStatsFingerprint : Fingerprint(
+internal object UmaSessionStatsTwoParamFingerprint : Fingerprint(
     definingClass = "Lorg/chromium/chrome/browser/metrics/UmaSessionStats;",
     name = "changeMetricsReportingConsent",
     returnType = "V",
     parameters = listOf("Z", "Z")
 )
+
+internal object UmaSessionStatsSingleParamFingerprint : Fingerprint(
+    definingClass = "Lorg/chromium/chrome/browser/metrics/UmaSessionStats;",
+    name = "changeMetricsReportingConsent",
+    returnType = "V",
+    parameters = listOf("Z")
+)
+
+// Android locale qualifiers in res/values-* start with either:
+//   - a 2-letter ISO 639-1 language code (e.g. values-fr, values-zh-rCN, values-es-v31)
+//   - a BCP-47 tag prefixed with "b+" (e.g. values-b+sr+Latn, values-b+es+419)
+// No non-locale Android configuration qualifier is a bare 2-letter lowercase segment or "b+*".
+private val ISO_2_LOCALE_SEGMENT = Regex("^[a-z]{2}$")
+
+private fun isNonEnglishLocaleValuesDir(dirName: String): Boolean {
+    if (!dirName.startsWith("values-")) return false
+    val qualifierPart = dirName.removePrefix("values-")
+    if (qualifierPart.isEmpty()) return false
+    val firstSegment = qualifierPart.substringBefore('-')
+
+    if (firstSegment.startsWith("b+")) {
+        return firstSegment != "b+en" && !firstSegment.startsWith("b+en+")
+    }
+    if (ISO_2_LOCALE_SEGMENT.matches(firstSegment)) {
+        return firstSegment != "en"
+    }
+    return false
+}
 
 @Suppress("unused")
 val telemetryAndLocaleTrimPatch = patch(
@@ -34,8 +62,8 @@ val telemetryAndLocaleTrimPatch = patch(
             addInstructions(0, "return-void")
         }
 
-        // 2. Force changeMetricsReportingConsent(ZZ)V parameters to false if method exists
-        UmaSessionStatsFingerprint.methodOrNull?.apply {
+        // 2. Force changeMetricsReportingConsent parameters to false (supports both (ZZ)V and upstream (Z)V)
+        UmaSessionStatsTwoParamFingerprint.methodOrNull?.apply {
             addInstructions(
                 0,
                 """
@@ -44,31 +72,19 @@ val telemetryAndLocaleTrimPatch = patch(
                 """.trimIndent()
             )
         }
-
-        // 3. Prune non-English locale resource directories, strictly preserving the standard non-locale configurations
-        // derived from recon_raw/delta/xml/locale_dirs.txt
-        val preservedNonLocaleConfigs = setOf(
-            "values",
-            "values-h360dp-land", "values-h480dp", "values-h480dp-land", "values-h500dp",
-            "values-h568dp", "values-h720dp", "values-h748dp", "values-hdpi", "values-land",
-            "values-large", "values-ldrtl", "values-night", "values-port", "values-sw1200dp",
-            "values-sw240dp", "values-sw280dp", "values-sw360dp", "values-sw600dp",
-            "values-sw600dp-h1000dp-port", "values-sw600dp-h1200dp-port", "values-sw600dp-h700dp-port",
-            "values-sw600dp-h800dp-port", "values-sw600dp-h900dp-port", "values-sw600dp-v30",
-            "values-sw600dp-w600dp", "values-sw720dp", "values-v31", "values-v33", "values-v34",
-            "values-v35", "values-w1000dp", "values-w1200dp", "values-w360dp", "values-w360dp-port",
-            "values-w400dp-port", "values-w412dp", "values-w600dp", "values-w800dp", "values-xlarge"
-        )
-
-        fun shouldPreserve(dirName: String): Boolean {
-            if (dirName.startsWith("values-en")) return true
-            return preservedNonLocaleConfigs.contains(dirName)
+        UmaSessionStatsSingleParamFingerprint.methodOrNull?.apply {
+            addInstructions(
+                0,
+                "const/4 p0, 0x0"
+            )
         }
 
+        // 3. Prune strictly non-English locale resource directories while preserving all non-locale
+        // Android configuration qualifiers (values-v*, values-night*, values-sw*, values-w*, values-h*, etc.)
         listApkEntries("res/values-").forEach { entry ->
             val parts = entry.removePrefix("res/").split("/")
             val dirName = parts.firstOrNull() ?: return@forEach
-            if (!shouldPreserve(dirName)) {
+            if (isNonEnglishLocaleValuesDir(dirName)) {
                 deleteResource(entry)
             }
         }
