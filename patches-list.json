@@ -346,33 +346,6 @@
       "options": []
     },
     {
-      "name": "Fullscreen Player Gestures",
-      "description": "Enables swipe gestures for volume, brightness, and seeking, plus long-press 2x speed in HTML5 fullscreen video.",
-      "default": true,
-      "category": null,
-      "compatiblePackages": [
-        {
-          "packageName": "com.brave.browser",
-          "name": "Brave Browser",
-          "description": null,
-          "apkFileType": "APKM",
-          "appIconColor": null,
-          "signatures": null,
-          "formFactor": "MOBILE",
-          "targets": [
-            {
-              "version": "1.100.58",
-              "versionCodes": null,
-              "isExperimental": false,
-              "minSdk": 26,
-              "description": null
-            }
-          ]
-        }
-      ],
-      "options": []
-    },
-    {
       "name": "Media & HLS Downloader",
       "description": "Adds a native toolbar button, HLS stream sniffer, and background MP4 remuxer to Brave Browser.",
       "default": true,

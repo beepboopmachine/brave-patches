@@ -1,6 +1,6 @@
 # Brave Browser Morphe Patches
 
-A modular, high-performance [Morphe](https://github.com/MorpheApp) patch suite for **Brave Browser for Android** (`com.brave.browser`), featuring native multi-threaded HLS & media downloading, true AMOLED black theming, player gestures, aggressive debloating, privacy hardening, and performance optimizations.
+A modular, high-performance [Morphe](https://github.com/MorpheApp) patch suite for **Brave Browser for Android** (`com.brave.browser`), featuring native multi-threaded HLS & media downloading, true AMOLED black theming, aggressive debloating, privacy hardening, and performance optimizations.
 
 ---
 
@@ -14,11 +14,6 @@ A modular, high-performance [Morphe](https://github.com/MorpheApp) patch suite f
 ### 2. UI & Appearance
 * **AMOLED Black Theme**: Replaces dark-gray surfaces (`#1F1F1F`) across dark mode, the omnibox address bar, dropdown menus, and settings with true pitch black (`#000000`) for maximum OLED battery savings and aesthetic contrast.
 * **Debloat Menu & Settings**: Strips unwanted promotional entries from the 3-dot overflow menu and main settings page (Brave Wallet, Leo AI, Brave News, Brave Talk, Brave Rewards, and Brave VPN).
-* **Fullscreen Player Gestures**: Adds intuitive touch gestures to fullscreen web video players:
-  * Left-side vertical swipe: Brightness control
-  * Right-side vertical swipe: Volume control
-  * Horizontal swipe: Video seek
-  * Double tap: Fast forward / rewind
 * **Clean New Tab Page**: Streamlines the new tab page by removing sponsored tiles, widgets, and background telemetry.
 * **Force Copy/Paste**: Overrides JavaScript handlers that block text selection, copy-pasting, or context menus.
 * **Tab Usability**: Preserves the last active tab from accidental closes and closes tabs according to tab group order.
@@ -56,7 +51,6 @@ A modular, high-performance [Morphe](https://github.com/MorpheApp) patch suite f
 │   ├── src/main/kotlin/dev/brave/patches/
 │   │   ├── clone/            # Side-by-side package cloning & branding
 │   │   ├── core/             # Core tab tracking & lifecycle hooks
-│   │   ├── gestures/         # Fullscreen player touch gestures
 │   │   ├── media/            # Media sniffer, Hls downloader & PiP
 │   │   ├── perf/             # Refresh rate, startup & background optimizations
 │   │   ├── privacy/          # Parameter stripping, sensors, incognito screenshots
@@ -67,7 +61,6 @@ A modular, high-performance [Morphe](https://github.com/MorpheApp) patch suite f
 │   ├── brave/                # Extension code compiled into dex
 │   │   ├── src/main/java/dev/brave/extension/
 │   │   │   ├── core/         # ActiveTabTracker, JsInjectionHub
-│   │   │   ├── gestures/     # Touch overlays & Chromium JS bridge
 │   │   │   ├── media/        # M3U8 parser, MediaDownloadService, stream resolver
 │   │   │   ├── perf/         # Refresh rate helper, startup helper
 │   │   │   ├── privacy/      # UrlStripper
