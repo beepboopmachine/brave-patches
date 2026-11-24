@@ -1,141 +1,96 @@
-# Brave Browser Morphe Patches
+# Brave Morphe Patches
 
-A modular, high-performance [Morphe](https://github.com/MorpheApp) patch suite for **Brave Browser for Android** (`com.brave.browser`), featuring native multi-threaded HLS & media downloading, true AMOLED black theming, aggressive debloating, privacy hardening, and performance optimizations.
+A collection of [Morphe](https://github.com/MorpheApp) patches for **Brave Browser on Android** (`com.brave.browser`).
 
----
-
-## Features & Patch Suite
-
-### 1. Media & Downloader
-* **Native Media & HLS Downloader**: Injects a custom download action button directly into the top toolbar next to Brave Shields. Automatically detects video, audio, and streaming formats (MP4, WebM, M3U8 HLS playlists, fMP4, TS segments) across web pages, embedded iframes, and YouTube streams.
-* **Multi-threaded Stream Downloader & Muxer**: Downloads HLS segments concurrently with background notification progress, supports AES-128 decrypting, and muxes video/audio streams into a clean, seekable MP4 file.
-* **Force Picture-in-Picture**: Enforces HTML5 video Picture-in-Picture support on all video players.
-
-### 2. UI & Appearance
-* **AMOLED Black Theme**: Replaces dark-gray surfaces (`#1F1F1F`) across dark mode, the omnibox address bar, dropdown menus, and settings with true pitch black (`#000000`) for maximum OLED battery savings and aesthetic contrast.
-* **Debloat Menu & Settings**: Strips unwanted promotional entries from the 3-dot overflow menu and main settings page (Brave Wallet, Leo AI, Brave News, Brave Talk, Brave Rewards, and Brave VPN).
-* **Clean New Tab Page**: Streamlines the new tab page by removing sponsored tiles, widgets, and background telemetry.
-* **Force Copy/Paste**: Overrides JavaScript handlers that block text selection, copy-pasting, or context menus.
-* **Tab Usability**: Preserves the last active tab from accidental closes and closes tabs according to tab group order.
-
-### 3. Privacy & Tracking Protection
-* **Strip Tracking Parameters**: Intercepts URL navigations and cleans tracking query parameters (such as `utm_*`, `fbclid`, `gclid`, `mc_eid`, etc.) before loading.
-* **Allow Incognito Screenshots**: Re-enables taking screenshots and viewing recents thumbnails inside Incognito tabs (`FLAG_SECURE` removal).
-* **Block Motion & Orientation Sensors**: Disables Chromium's `PlatformSensorProvider` to prevent fingerprinting or sensor-based orientation profiling.
-* **Block Promo Notifications & Dialogs**: Disables in-app rating requests and onboarding promotion popups.
-
-### 4. Performance & Resource Optimization
-* **Force Max Refresh Rate**: Unlocks high display refresh rates (90Hz / 120Hz / 144Hz) consistently across compatible devices.
-* **Startup Optimization**: Defers non-critical startup tasks to accelerate initial browser launch.
-* **Telemetry & Locale Trim**: Eliminates background metrics dispatching and cleans unused locale data to lower memory usage.
-* **Stop Background Wakeups**: Prevents aggressive background wakeups and alarm triggers.
-* **Remove Unused AR/XR**: Strips unused Virtual/Augmented Reality modules to shrink memory and binary size.
-
-### 5. Standalone Clone & Branding
-* **Clone Package Branding**: Enables side-by-side installation alongside official Brave by altering the package namespace to `com.brave.browser.clone` ("Brave Mod"). Includes custom Android Adaptive Vector Icons with Material You monochrome support.
+Built for **Brave v1.100.58** (`versionCode: 430005804`, Android 8.0+ / API 26+). It adds a built-in media & HLS downloader, true AMOLED black dark mode, debloating, privacy tweaks, and a few quality-of-life fixes.
 
 ---
 
-## Compatibility
+## Included Patches (22)
 
-| Target Application | Target Version | Target Architecture | Minimum Android Version |
-|:---|:---|:---|:---|
-| **Brave Browser Android** (`com.brave.browser`) | `1.100.58` (`versionCode: 430005804`) | `arm64-v8a`, `armeabi-v7a`, `x86_64` | Android 8.0+ (API 26+) |
+### Media & Downloads
+- **Media & HLS Downloader** — Adds a download button to the top toolbar that sniffs video/audio streams (MP4, WebM, M3U8/HLS, TS, fMP4, embedded iframes) and downloads/remuxes them in the background to MP4 (including AES-128 encrypted streams).
+- **Force Picture-in-Picture** — Strips `disablePictureInPicture` restrictions on HTML5 video elements so PiP always works.
 
----
+### UI & Usability
+- **AMOLED Black Theme** — Replaces dark-gray dark mode surfaces (`#1F1F1F`) across the browser UI, omnibox, menus, and settings with pure black (`#000000`).
+- **Strip Menu & Settings Bloat** — Removes Brave Wallet, Leo AI, Brave News, Brave Rewards, and VPN entries from the 3-dot menu and Settings.
+- **Brave Origin** — Unlocks Brave Origin feature switches across Rewards, News, Wallet, Leo AI, and VPN.
+- **Clean New Tab Page** — Forces a 4-column shortcut grid, removes sponsored NTP background ads, and disables the Brave News feed.
+- **Force Copy / Paste** — Unblocks text selection, copy, cut, paste, and context menus on sites that try to disable them.
+- **Close Tab In Group Order** — Selects the previous tab in the tab group when closing a tab instead of jumping forward.
+- **Preserve Last Active Tab** — Stops Brave from forcing the New Tab screen after inactivity so your last tab stays open.
+- **Skip Welcome Screens** — Marks first-run onboarding as completed to skip welcome prompts on fresh installs.
+- **Block Popups & Ratings** — Disables the in-app rating prompt and Brave Ads signup onboarding dialogs.
 
-## Project Structure
+### Privacy
+- **Strip Tracking Parameters** — Removes marketing and analytics parameters (`utm_*`, `fbclid`, `gclid`, etc.) when copying or sharing URLs.
+- **Allow Incognito Screenshots** — Removes the screenshot/recents restriction inside Incognito tabs.
+- **Block Motion Sensors** — Disables Chromium's Android `PlatformSensorProvider` so pages can't read accelerometer or orientation sensors.
+- **Stop Promo Notifications** — Disables Brave retention notification alarms/receivers and Chromium tips opt-in promos.
 
-```
-├── patches/                  # Morphe patches written in Kotlin
-│   ├── src/main/kotlin/dev/brave/patches/
-│   │   ├── clone/            # Side-by-side package cloning & branding
-│   │   ├── core/             # Core tab tracking & lifecycle hooks
-│   │   ├── media/            # Media sniffer, Hls downloader & PiP
-│   │   ├── perf/             # Refresh rate, startup & background optimizations
-│   │   ├── privacy/          # Parameter stripping, sensors, incognito screenshots
-│   │   ├── shared/           # Constants and shared utilities
-│   │   └── ui/               # AMOLED black, debloating, and tab order
-│   └── build.gradle.kts      # Patches compilation & bytecode verification
-├── extensions/               # Injected Java extensions & Chromium stubs
-│   ├── brave/                # Extension code compiled into dex
-│   │   ├── src/main/java/dev/brave/extension/
-│   │   │   ├── core/         # ActiveTabTracker, JsInjectionHub
-│   │   │   ├── media/        # M3U8 parser, MediaDownloadService, stream resolver
-│   │   │   ├── perf/         # Refresh rate helper, startup helper
-│   │   │   ├── privacy/      # UrlStripper
-│   │   │   └── ui/           # AmoledColorHelper, MenuHelper
-│   │   └── stub/             # Chromium compile-time API stubs
-│   └── proguard-rules.pro    # Proguard retention rules
-├── branding/                 # Adaptive vector icon assets for cloned build
-├── docs/                     # Architectural specs and QA verification checklist
-├── patches-list.json         # Generated patch metadata and targets list
-├── build.gradle.kts          # Root Gradle configuration
-└── settings.gradle.kts       # Gradle plugin & extension configuration
-```
+### Performance & Cleanup
+- **Force Max Refresh Rate** — Locks the display mode to the highest supported refresh rate (90Hz / 120Hz / 144Hz) at native panel resolution.
+- **Startup Optimization** — Skips partner customization checks on cold start and drains deferred startup listeners immediately.
+- **Telemetry & Locale Trim** — Disables P3A telemetry serialization and metrics consent, and prunes unused locale resources.
+- **Stop Background Wakeups** — Disables Chromium's background-sync task scheduler gate to prevent periodic background wakeups.
+- **Remove Unused AR & XR** — Strips unused ARCore native libraries from the APK to cut down install size.
+
+### Core & Cloning
+- **Brave Core Infrastructure** — Shared active-tab tracking and navigation lifecycle hooks used by the other patches.
+- **Clone Package & Branding** — Changes the package name (`com.brave.browser.clone`), authorities, and permissions so you can install the patched build alongside official Brave, with custom adaptive icons in `branding/`.
 
 ---
 
 ## Building from Source
 
-### Prerequisites
-* **Java Development Kit (JDK)**: JDK 17 or JDK 21
-* **Android SDK**: Build-Tools and Platform SDK 34+
-* **Gradle**: 8.x+ (Gradle wrapper `9.9.1` included)
-
-### Build the Patches JAR
-Run the Gradle wrapper:
+You'll need **JDK 17 or 21** and an **Android SDK** (API 26+).
 
 ```bash
-# On Linux / macOS:
+# Linux / macOS
 ./gradlew build
 
-# On Windows:
+# Windows
 .\gradlew.bat build
 ```
 
-This compiles both the extensions and patches, runs API compatibility checks, and outputs:
+The compiled patch bundle is written to:
 ```
-patches/build/libs/patches-<version>.jar
+patches/build/libs/patches-1.0.0.mpp
 ```
 
-To update the `patches-list.json` metadata file:
+To regenerate `patches-list.json` after editing patches:
 ```bash
 ./gradlew generatePatchesList
 ```
 
 ---
 
-## Patching Brave Browser
+## Patching Brave
 
-### Using Morphe CLI
-1. Download or compile the patches JAR: `patches-<version>.jar`.
-2. Obtain the clean target APK (`com.brave.browser` v1.100.58).
-3. Run the Morphe CLI:
+1. Grab a clean **Brave Browser v1.100.58** APK/APKM (`com.brave.browser`).
+2. Build `patches-1.0.0.mpp` (or download it from Releases if available).
+3. Run Morphe CLI against the APK:
 
 ```bash
 java -jar morphe-cli.jar patch \
-  --patches patches-1.0.0.jar \
-  --package com.brave.browser \
-  --out Brave-Patched.apk \
+  --patches patches/build/libs/patches-1.0.0.mpp \
+  --out brave-patched.apk \
   base.apk
 ```
 
-### Using Morphe Manager / ReVanced Manager
-1. In Manager Settings, configure the custom sources to point to this repository or load the compiled `patches-<version>.jar`.
-2. Select **Brave Browser** (`v1.100.58`).
-3. Select your desired patches from the patch list.
-4. Tap **Patch** and install.
+---
+
+## Repo Layout
+
+- `patches/` — Morphe patch definitions in Kotlin (`dev.brave.patches.*`)
+- `extensions/` — Injected Android/Java extension code (`dev.brave.extension.*`) and Chromium compile stubs
+- `branding/` — Adaptive vector launcher icons for cloned builds
+- `docs/` — QA verification checklist
+- `patches-list.json` — Auto-generated patch metadata
 
 ---
 
-## Contributing & Development
-1. Fork and clone the repository.
-2. Submit code conforming to existing Morphe Kotlin conventions.
-3. Test builds with `./gradlew build` prior to submitting a Pull Request.
+## License
 
----
-
-## Disclaimer & License
-* This project is an independent open-source patch suite and is not affiliated with, endorsed by, or associated with Brave Software, Inc.
-* Distributed under the **GNU General Public License v3.0 (GPLv3)**.
+[GPLv3](https://www.gnu.org/licenses/gpl-3.0.html). Not affiliated with Brave Software, Inc.
