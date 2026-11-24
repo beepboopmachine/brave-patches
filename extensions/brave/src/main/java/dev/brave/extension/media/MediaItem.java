@@ -1,0 +1,134 @@
+package dev.brave.extension.media;
+
+import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Objects;
+
+public class MediaItem implements Serializable {
+    private static final long serialVersionUID = 1L;
+
+    public static class HlsVariant implements Serializable, Comparable<HlsVariant> {
+        private static final long serialVersionUID = 1L;
+        public final String url;
+        public final int bandwidth;
+        public final int width;
+        public final int height;
+        public final String codecs;
+
+        public HlsVariant(String url, int bandwidth, int width, int height, String codecs) {
+            this.url = url;
+            this.bandwidth = bandwidth;
+            this.width = width;
+            this.height = height;
+            this.codecs = codecs != null ? codecs : "";
+        }
+
+        public String getResolutionLabel() {
+            if (height > 0) {
+                return height + "p";
+            }
+            if (bandwidth > 0) {
+                return (bandwidth / 1000) + " kbps";
+            }
+            return "Default";
+        }
+
+        @Override
+        public int compareTo(HlsVariant other) {
+            // Lexicographical: higher resolution first, then higher bandwidth
+            if (this.height != other.height) {
+                return Integer.compare(other.height, this.height);
+            }
+            return Integer.compare(other.bandwidth, this.bandwidth);
+        }
+    }
+
+    public final String id;
+    public final MediaType type;
+    public final String url;
+    public volatile String title;
+    public volatile String mimeType;
+    public volatile long sizeBytes;
+    public volatile int width;
+    public volatile int height;
+    public volatile long durationMs;
+    public final String userAgent;
+    public final String cookie;
+    public final String referer;
+    public final int tabId;
+    public final long timestamp;
+    public final List<HlsVariant> variants = new ArrayList<>();
+
+    public MediaItem(
+            String id,
+            MediaType type,
+            String url,
+            String title,
+            String mimeType,
+            long sizeBytes,
+            int width,
+            int height,
+            long durationMs,
+            String userAgent,
+            String cookie,
+            String referer,
+            int tabId
+    ) {
+        this.url = url != null ? url : "";
+        this.id = id != null ? id : this.url;
+        this.type = type != null ? type : MediaType.VIDEO;
+        this.title = (title != null && !title.trim().isEmpty()) ? title.trim() : "Media_" + Math.abs(this.url.hashCode() % 100000);
+        this.mimeType = mimeType != null ? mimeType : "";
+        this.sizeBytes = sizeBytes;
+        this.width = width;
+        this.height = height;
+        this.durationMs = durationMs;
+        this.userAgent = userAgent != null ? userAgent : "";
+        this.cookie = cookie != null ? cookie : "";
+        this.referer = referer != null ? referer : "";
+        this.tabId = tabId;
+        this.timestamp = System.currentTimeMillis();
+    }
+
+    public synchronized void updateEnrichedMetadata(String title, String mime, int w, int h, long size, long dur) {
+        if (title != null && !title.trim().isEmpty() && !title.startsWith("Media_")) {
+            this.title = title.trim();
+        }
+        if (mime != null && !mime.isEmpty()) {
+            this.mimeType = mime;
+        }
+        if (w > 0) this.width = w;
+        if (h > 0) this.height = h;
+        if (size > 0) this.sizeBytes = size;
+        if (dur > 0) this.durationMs = dur;
+    }
+
+    public String getFormattedSize() {
+        if (sizeBytes <= 0) return "";
+        if (sizeBytes < 1024) return sizeBytes + " B";
+        if (sizeBytes < 1024 * 1024) return String.format("%.1f KB", sizeBytes / 1024.0);
+        if (sizeBytes < 1024 * 1024 * 1024) return String.format("%.1f MB", sizeBytes / (1024.0 * 1024.0));
+        return String.format("%.2f GB", sizeBytes / (1024.0 * 1024.0 * 1024.0));
+    }
+
+    public String getResolutionString() {
+        if (width > 0 && height > 0) {
+            return width + "x" + height;
+        }
+        return "";
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        MediaItem mediaItem = (MediaItem) o;
+        return Objects.equals(url, mediaItem.url);
+    }
+
+    @Override
+    public int hashCode() {
+        return url != null ? url.hashCode() : 0;
+    }
+}

@@ -1,0 +1,60 @@
+{
+  "NOTE": "Do NOT manually edit this file. This file is automatically updated when patches are compiled.",
+  "version": "1.0.0",
+  "patches": [
+    {
+      "name": "Brave Core Infrastructure",
+      "description": "Provides unified active tab tracking and navigation lifecycle events for Brave patches.",
+      "default": true,
+      "category": null,
+      "compatiblePackages": [
+        {
+          "packageName": "com.brave.browser",
+          "name": "Brave Browser",
+          "description": null,
+          "apkFileType": "APKM",
+          "appIconColor": null,
+          "signatures": null,
+          "formFactor": "MOBILE",
+          "targets": [
+            {
+              "version": "1.100.58",
+              "versionCodes": null,
+              "isExperimental": false,
+              "minSdk": 26,
+              "description": null
+            }
+          ]
+        }
+      ],
+      "options": []
+    },
+    {
+      "name": "Media & HLS Downloader",
+      "description": "Adds a native toolbar button, HLS stream sniffer, and background MP4 remuxer to Brave Browser.",
+      "default": true,
+      "category": null,
+      "compatiblePackages": [
+        {
+          "packageName": "com.brave.browser",
+          "name": "Brave Browser",
+          "description": null,
+          "apkFileType": "APKM",
+          "appIconColor": null,
+          "signatures": null,
+          "formFactor": "MOBILE",
+          "targets": [
+            {
+              "version": "1.100.58",
+              "versionCodes": null,
+              "isExperimental": false,
+              "minSdk": 26,
+              "description": null
+            }
+          ]
+        }
+      ],
+      "options": []
+    }
+  ]
+}

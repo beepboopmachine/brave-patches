@@ -1,0 +1,12 @@
+﻿.gradle/
+.kotlin/
+build/
+**/build/
+target/
+work/
+recon_raw/
+test_splits/
+*.apk
+*.apkm
+*.idsig
+*.txt
