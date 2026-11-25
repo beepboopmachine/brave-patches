@@ -1,6 +1,5 @@
 package dev.brave.extension.media;
 
-import android.graphics.Bitmap;
 import android.media.MediaCodec;
 import android.media.MediaExtractor;
 import android.media.MediaFormat;
@@ -9,8 +8,8 @@ import android.net.Uri;
 import android.util.Log;
 import java.io.BufferedInputStream;
 import java.io.BufferedReader;
-import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -86,6 +85,17 @@ public final class LocalDownloadRelay {
             final boolean convertWebpToPng,
             final BiConsumer<Boolean, String> onComplete
     ) {
+        return startRelay(item, filename, resolvedMime, convertWebpToPng, null, onComplete);
+    }
+
+    public static String startRelay(
+            final MediaItem item,
+            final String filename,
+            final String resolvedMime,
+            final boolean convertWebpToPng,
+            final Runnable onAuthFallback,
+            final BiConsumer<Boolean, String> onComplete
+    ) {
         if (item == null || item.url == null || item.url.isEmpty()) return null;
         ServerSocket server = null;
         try {
@@ -104,6 +114,7 @@ public final class LocalDownloadRelay {
             try {
                 RELAY_POOL.execute(() -> {
                     boolean transferSucceeded = false;
+                    boolean authFallbackTriggered = false;
                     final String[] finalServedName = new String[]{ origSafeName };
                     try (ServerSocket ss = boundServer) {
                         for (int attempt = 0; attempt < 64; attempt++) {
@@ -188,40 +199,48 @@ public final class LocalDownloadRelay {
                                             Log.w(TAG, "Relay upstream returned empty body for " + item.url);
                                             break;
                                         }
-                                        byte[] payload = rawBytes;
                                         String outMime = ct;
                                         // Default fallback name preserves original extension (NOT .png!)
                                         String outName = origSafeName;
+                                        File pngTempFile = File.createTempFile("webp_png_", ".png");
+                                        boolean convertedToFile = false;
                                         try {
-                                            Bitmap bmp = ThumbnailLoader.decodeBoundedForConversion(rawBytes);
-                                            if (bmp != null) {
-                                                ByteArrayOutputStream pngOut = new ByteArrayOutputStream();
-                                                boolean compressed = bmp.compress(Bitmap.CompressFormat.PNG, 100, pngOut);
-                                                bmp.recycle();
-                                                if (compressed && pngOut.size() > 0) {
-                                                    payload = pngOut.toByteArray();
-                                                    outMime = "image/png";
-                                                    outName = pngCandidateName;
-                                                    if (!outName.toLowerCase(Locale.ROOT).endsWith(".png")) {
-                                                        outName = outName + ".png";
-                                                    }
+                                            convertedToFile = ThumbnailLoader.convertWebpBytesToPngFile(rawBytes, pngTempFile);
+                                            if (convertedToFile) {
+                                                rawBytes = null; // Release source bytes before streaming PNG file
+                                                outMime = "image/png";
+                                                outName = pngCandidateName;
+                                                if (!outName.toLowerCase(Locale.ROOT).endsWith(".png")) {
+                                                    outName = outName + ".png";
                                                 }
                                             }
-                                        } catch (Throwable ignored) {}
-
-                                        outName = sanitizePathSegment(outName);
-                                        String headers = "HTTP/1.1 200 OK\r\n"
-                                                + "Content-Type: " + NetworkSafety.sanitizeMimeType(outMime, "image/webp") + "\r\n"
-                                                + "Content-Disposition: attachment; filename=\"" + outName + "\"\r\n"
-                                                + "Content-Length: " + payload.length + "\r\n"
-                                                + "Connection: close\r\n\r\n";
-                                        out.write(headers.getBytes(StandardCharsets.UTF_8));
-                                        out.write(payload);
-                                        out.flush();
-                                        finishedTransfer = true;
-                                        transferSucceeded = true;
-                                        finalServedName[0] = outName;
-                                        Log.i(TAG, "Relay WebP->PNG complete for " + outName + " (" + payload.length + " bytes)");
+                                            outName = sanitizePathSegment(outName);
+                                            long payloadLen = convertedToFile ? pngTempFile.length() : rawBytes.length;
+                                            String headers = "HTTP/1.1 200 OK\r\n"
+                                                    + "Content-Type: " + NetworkSafety.sanitizeMimeType(outMime, "image/webp") + "\r\n"
+                                                    + "Content-Disposition: attachment; filename=\"" + outName + "\"\r\n"
+                                                    + "Content-Length: " + payloadLen + "\r\n"
+                                                    + "Connection: close\r\n\r\n";
+                                            out.write(headers.getBytes(StandardCharsets.UTF_8));
+                                            if (convertedToFile) {
+                                                try (InputStream pin = new BufferedInputStream(new FileInputStream(pngTempFile), 32 * 1024)) {
+                                                    byte[] buf = new byte[32 * 1024];
+                                                    int r;
+                                                    while ((r = pin.read(buf)) != -1) {
+                                                        out.write(buf, 0, r);
+                                                    }
+                                                }
+                                            } else {
+                                                out.write(rawBytes);
+                                            }
+                                            out.flush();
+                                            finishedTransfer = true;
+                                            transferSucceeded = true;
+                                            finalServedName[0] = outName;
+                                            Log.i(TAG, "Relay WebP->PNG complete for " + outName + " (" + payloadLen + " bytes)");
+                                        } finally {
+                                            if (pngTempFile.exists()) pngTempFile.delete();
+                                        }
                                     } else {
                                         long contentLength = sc.conn.getContentLengthLong();
                                         if (!isHead && contentLength == 0) {
@@ -231,6 +250,7 @@ public final class LocalDownloadRelay {
                                         }
                                         String contentRange = NetworkSafety.stripControlChars(sc.conn.getHeaderField("Content-Range"));
                                         boolean rangeCoversEnd = false;
+                                        long expectedSliceLen = -1;
                                         if (code == 206) {
                                             Matcher crm = CONTENT_RANGE_PATTERN.matcher(contentRange);
                                             if (!crm.find()) {
@@ -244,18 +264,50 @@ public final class LocalDownloadRelay {
                                                 writeSimpleResponse(out, 502, "Invalid Content-Range");
                                                 break;
                                             }
-                                            long expectedSlice = (crEnd - crStart) + 1L;
-                                            if (contentLength >= 0 && contentLength != expectedSlice) {
+                                            expectedSliceLen = (crEnd - crStart) + 1L;
+                                            if (contentLength >= 0 && contentLength != expectedSliceLen) {
                                                 writeSimpleResponse(out, 502, "Range Length Mismatch");
                                                 break;
                                             }
+                                            long crTotal = -1;
                                             if (!"*".equals(crm.group(3))) {
-                                                long crTotal = Long.parseLong(crm.group(3));
+                                                crTotal = Long.parseLong(crm.group(3));
                                                 if (crEnd >= crTotal) {
                                                     writeSimpleResponse(out, 502, "Range Exceeds Total");
                                                     break;
                                                 }
                                                 rangeCoversEnd = (crEnd == crTotal - 1);
+                                            }
+                                            // Validate returned 206 range matches what Chromium actually requested
+                                            if (rangeHeader != null && !rangeHeader.isEmpty()) {
+                                                Matcher reqM = REQ_RANGE_PATTERN.matcher(rangeHeader.trim());
+                                                if (!reqM.matches()) {
+                                                    writeSimpleResponse(out, 502, "Unsupported Range Request");
+                                                    break;
+                                                }
+                                                String rs = reqM.group(1);
+                                                String re = reqM.group(2);
+                                                if (!rs.isEmpty()) {
+                                                    long reqStart = Long.parseLong(rs);
+                                                    if (crStart != reqStart) {
+                                                        writeSimpleResponse(out, 502, "Content-Range Start Mismatch");
+                                                        break;
+                                                    }
+                                                    if (!re.isEmpty()) {
+                                                        long reqEnd = Long.parseLong(re);
+                                                        if (crEnd > reqEnd) {
+                                                            writeSimpleResponse(out, 502, "Content-Range End Mismatch");
+                                                            break;
+                                                        }
+                                                    }
+                                                } else if (!re.isEmpty() && crTotal >= 0) {
+                                                    long suffix = Long.parseLong(re);
+                                                    long expectedSuffixStart = Math.max(0L, crTotal - suffix);
+                                                    if (crStart != expectedSuffixStart || crEnd != crTotal - 1) {
+                                                        writeSimpleResponse(out, 502, "Content-Range Suffix Mismatch");
+                                                        break;
+                                                    }
+                                                }
                                             }
                                         }
 
@@ -285,7 +337,10 @@ public final class LocalDownloadRelay {
                                                 }
                                                 out.flush();
                                             }
-                                            if (totalWritten > 0 && (contentLength < 0 || totalWritten == contentLength)) {
+                                            boolean lengthOk = (code == 206)
+                                                    ? (totalWritten == expectedSliceLen && (contentLength < 0 || totalWritten == contentLength))
+                                                    : (totalWritten > 0 && (contentLength < 0 || totalWritten == contentLength));
+                                            if (lengthOk) {
                                                 if (code == 200 || rangeCoversEnd) {
                                                     finishedTransfer = true;
                                                     transferSucceeded = true;
@@ -296,7 +351,8 @@ public final class LocalDownloadRelay {
                                                     Log.d(TAG, "Relay served 206 chunk for " + origSafeName + " (" + contentRange + ")");
                                                 }
                                             } else {
-                                                Log.w(TAG, "Relay truncated/empty stream for " + origSafeName + ": " + totalWritten + "/" + contentLength);
+                                                Log.w(TAG, "Relay length mismatch for " + origSafeName + ": wrote=" + totalWritten
+                                                        + " cl=" + contentLength + " expectedSlice=" + expectedSliceLen);
                                                 transferSucceeded = false;
                                                 break;
                                             }
@@ -307,6 +363,9 @@ public final class LocalDownloadRelay {
                                 } else {
                                     writeSimpleResponse(out, (code == 204) ? 502 : code, "Upstream Error");
                                     Log.w(TAG, "Upstream returned HTTP " + code + " for " + item.url);
+                                    if ((code == 401 || code == 403) && onAuthFallback != null) {
+                                        authFallbackTriggered = true;
+                                    }
                                     break;
                                 }
                             } finally {
@@ -321,7 +380,15 @@ public final class LocalDownloadRelay {
                         Log.w(TAG, "Relay error for " + item.url + ": " + t.getMessage());
                     } finally {
                         ACTIVE_RELAYS.remove(relayUrl, boundServer);
-                        if (onComplete != null) onComplete.accept(transferSucceeded, finalServedName[0]);
+                        if (authFallbackTriggered && onAuthFallback != null) {
+                            try {
+                                onAuthFallback.run();
+                            } catch (Throwable t) {
+                                if (onComplete != null) onComplete.accept(false, finalServedName[0]);
+                            }
+                        } else if (onComplete != null) {
+                            onComplete.accept(transferSucceeded, finalServedName[0]);
+                        }
                     }
                 });
             } catch (RejectedExecutionException rex) {

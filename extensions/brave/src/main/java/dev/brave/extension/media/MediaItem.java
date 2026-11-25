@@ -269,4 +269,43 @@ public class MediaItem implements Serializable {
     public int hashCode() {
         return url != null ? url.hashCode() : 0;
     }
+
+    /**
+     * Shared container extension & default MIME resolver used by both the picker relay path
+     * and the direct MediaDownloadService fallback path.
+     * Returns a 2-element array: { extensionWithDot, defaultMime }.
+     */
+    public static String[] resolveContainerFormat(String rawMime, String url, MediaType mediaType) {
+        String ext = (mediaType == MediaType.AUDIO) ? ".mp3" : ".mp4";
+        String defaultMime = (mediaType == MediaType.AUDIO) ? "audio/mpeg" : "video/mp4";
+        String mimeLower = (rawMime != null) ? rawMime.toLowerCase(java.util.Locale.ROOT).trim() : "";
+        int semi = mimeLower.indexOf(';');
+        if (semi >= 0) mimeLower = mimeLower.substring(0, semi).trim();
+
+        String pathLower = "";
+        if (url != null && !url.isEmpty()) {
+            try {
+                String path = android.net.Uri.parse(url).getPath();
+                if (path != null) pathLower = path.toLowerCase(java.util.Locale.ROOT);
+            } catch (Throwable ignored) {}
+        }
+
+        if (mimeLower.contains("webm") || pathLower.endsWith(".webm")) { ext = ".webm"; defaultMime = "video/webm"; }
+        else if (mimeLower.contains("matroska") || pathLower.endsWith(".mkv")) { ext = ".mkv"; defaultMime = "video/x-matroska"; }
+        else if (mimeLower.contains("quicktime") || pathLower.endsWith(".mov")) { ext = ".mov"; defaultMime = "video/quicktime"; }
+        else if (mimeLower.contains("x-msvideo") || pathLower.endsWith(".avi")) { ext = ".avi"; defaultMime = "video/x-msvideo"; }
+        else if (mimeLower.contains("x-flv") || pathLower.endsWith(".flv") || pathLower.endsWith(".f4v")) { ext = ".flv"; defaultMime = "video/x-flv"; }
+        else if (mimeLower.contains("3gpp") || pathLower.endsWith(".3gp")) { ext = ".3gp"; defaultMime = "video/3gpp"; }
+        else if (mimeLower.equals("video/ogg") || pathLower.endsWith(".ogv")) { ext = ".ogv"; defaultMime = "video/ogg"; }
+        else if (mimeLower.equals("image/gif") || pathLower.endsWith(".gif")) { ext = ".gif"; defaultMime = "image/gif"; }
+        else if (mimeLower.equals("audio/mp4") || pathLower.endsWith(".m4a")) { ext = ".m4a"; defaultMime = "audio/mp4"; }
+        else if (mimeLower.equals("audio/aac") || pathLower.endsWith(".aac")) { ext = ".aac"; defaultMime = "audio/aac"; }
+        else if (mimeLower.equals("audio/ogg") || mimeLower.equals("audio/opus") || pathLower.endsWith(".ogg") || pathLower.endsWith(".opus")) { ext = ".ogg"; defaultMime = "audio/ogg"; }
+        else if (mimeLower.equals("audio/flac") || pathLower.endsWith(".flac")) { ext = ".flac"; defaultMime = "audio/flac"; }
+        else if (mimeLower.equals("audio/wav") || pathLower.endsWith(".wav")) { ext = ".wav"; defaultMime = "audio/wav"; }
+        else if (mimeLower.equals("audio/mpeg") || pathLower.endsWith(".mp3")) { ext = ".mp3"; defaultMime = "audio/mpeg"; }
+        else if (mimeLower.equals("video/mp4") || pathLower.endsWith(".mp4") || pathLower.endsWith(".m4v")) { ext = ".mp4"; defaultMime = "video/mp4"; }
+
+        return new String[]{ ext, defaultMime };
+    }
 }

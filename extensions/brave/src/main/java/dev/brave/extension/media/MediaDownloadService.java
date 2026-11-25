@@ -24,7 +24,6 @@ import android.util.Log;
 import dev.brave.extension.core.PatchPrefs;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -47,6 +46,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import javax.crypto.Cipher;
@@ -66,10 +66,14 @@ public class MediaDownloadService extends Service {
     );
     private static final int MAX_KEY_BYTES = 1024; // 1 KB
     private static final int MAX_SEGMENT_BYTES = 32 * 1024 * 1024; // 32 MB per segment
+    private static final long MAX_HLS_TOTAL_BYTES = 2L * 1024L * 1024L * 1024L; // 2 GiB aggregate HLS cap
+    private static final double MAX_HLS_DURATION_SECONDS = 6.0 * 3600.0; // 6 hour cap
+    private static final long MIN_FREE_DISK_BYTES = 128L * 1024L * 1024L; // Keep >= 128 MB free headroom
     private static final int MAX_IMAGE_BYTES = 25 * 1024 * 1024; // 25 MB per image
     private static final int HLS_CONCURRENCY = 4;
     private static final int HLS_PREFETCH_WINDOW = 8;
     private static final int MAX_SEGMENT_RETRIES = 3;
+    private static final Object DEST_RESERVE_LOCK = new Object();
 
     public static final String ACTION_DOWNLOAD_MEDIA = "dev.brave.action.DOWNLOAD_MEDIA";
     public static final String ACTION_DOWNLOAD_IMAGES = "dev.brave.action.DOWNLOAD_IMAGES";
@@ -105,6 +109,7 @@ public class MediaDownloadService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        NetworkSafety.initContext(this);
         mNotifManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
         createNotificationChannel();
     }
@@ -404,6 +409,7 @@ public class MediaDownloadService extends Service {
         }
 
         boolean isFmp4 = false;
+        double totalDurationSec = 0.0;
         for (int i = 0; i < segments.size(); i++) {
             HlsParser.SegmentInfo seg = segments.get(i);
             if ((seg.keyInfo != null && seg.keyInfo.isUnsupportedEncryption())
@@ -416,20 +422,29 @@ public class MediaDownloadService extends Service {
             if (seg.initSegmentUrl != null && !seg.initSegmentUrl.isEmpty()) {
                 isFmp4 = true;
             }
+            if (seg.durationSec > 0) totalDurationSec += seg.durationSec;
+        }
+        if (totalDurationSec > MAX_HLS_DURATION_SECONDS) {
+            throw new IOException("HLS playlist duration exceeds maximum supported limit (6 hours)");
         }
 
         File tempDir = new File(getCacheDir(), "brave_hls_" + UUID.randomUUID().toString());
         if (!tempDir.mkdirs()) {
             throw new IllegalStateException("Failed creating temporary directory for HLS download");
         }
+        if (tempDir.getUsableSpace() < MIN_FREE_DISK_BYTES) {
+            deleteRecursive(tempDir);
+            throw new IOException("Insufficient free storage space for HLS download");
+        }
 
         File concatenatedVideo = new File(tempDir, isFmp4 ? "stream_video.mp4" : "stream_video.ts");
         File concatenatedAudio = null;
+        AtomicLong cumulativeBytes = new AtomicLong(0L);
 
         try {
             // Download primary (video / muxed) segments in parallel bounded windows
             downloadHlsSegmentList(segments, item, refPage, concatenatedVideo, jp,
-                    0, audioPlaylistUrl.isEmpty() ? 85 : 65, "segment");
+                    0, audioPlaylistUrl.isEmpty() ? 85 : 65, "segment", cumulativeBytes);
 
             // Download separate EXT-X-MEDIA audio rendition if present
             if (!audioPlaylistUrl.isEmpty()) {
@@ -442,6 +457,7 @@ public class MediaDownloadService extends Service {
                     throw new IllegalStateException("No media segments found in HLS audio rendition playlist");
                 }
                 boolean audioIsFmp4 = false;
+                double audioDurationSec = 0.0;
                 for (int i = 0; i < audioSegments.size(); i++) {
                     HlsParser.SegmentInfo seg = audioSegments.get(i);
                     if ((seg.keyInfo != null && seg.keyInfo.isUnsupportedEncryption())
@@ -454,9 +470,13 @@ public class MediaDownloadService extends Service {
                     if (seg.initSegmentUrl != null && !seg.initSegmentUrl.isEmpty()) {
                         audioIsFmp4 = true;
                     }
+                    if (seg.durationSec > 0) audioDurationSec += seg.durationSec;
+                }
+                if (audioDurationSec > MAX_HLS_DURATION_SECONDS) {
+                    throw new IOException("HLS audio rendition duration exceeds maximum supported limit (6 hours)");
                 }
                 concatenatedAudio = new File(tempDir, audioIsFmp4 ? "stream_audio.m4a" : "stream_audio.ts");
-                downloadHlsSegmentList(audioSegments, item, refPage, concatenatedAudio, jp, 65, 85, "audio");
+                downloadHlsSegmentList(audioSegments, item, refPage, concatenatedAudio, jp, 65, 85, "audio", cumulativeBytes);
             }
 
             if (mShuttingDown || Thread.currentThread().isInterrupted()) {
@@ -491,7 +511,7 @@ public class MediaDownloadService extends Service {
     /**
      * Downloads HLS segments concurrently into temp files using a bounded worker pool and sliding window,
      * decrypts both EXT-X-MAP init sections and media segments fail-closed, respects EXT-X-BYTERANGE,
-     * retries transient failures, and aborts on any missing segment.
+     * enforces aggregate byte/disk quotas, retries transient failures, and aborts on any missing segment.
      */
     private void downloadHlsSegmentList(
             List<HlsParser.SegmentInfo> segments,
@@ -501,7 +521,8 @@ public class MediaDownloadService extends Service {
             JobProgress jp,
             int progressStart,
             int progressEnd,
-            String label
+            String label,
+            AtomicLong cumulativeBytes
     ) throws Exception {
         final int total = segments.size();
         final Map<String, byte[]> keyCache = new ConcurrentHashMap<>();
@@ -534,6 +555,10 @@ public class MediaDownloadService extends Service {
                     int idx = windowStart + offset;
                     HlsParser.SegmentInfo seg = segments.get(idx);
 
+                    if ((idx & 15) == 0 && outputFile.getParentFile().getUsableSpace() < MIN_FREE_DISK_BYTES) {
+                        throw new IOException("Insufficient free storage space during HLS download");
+                    }
+
                     // Fetch & decrypt EXT-X-MAP initialization segment once per unique (url, range)
                     if (seg.initSegmentUrl != null && !seg.initSegmentUrl.isEmpty()) {
                         String initKeyId = seg.initSegmentUrl + "@" + seg.initSegmentByteRangeOffset + ":" + seg.initSegmentByteRangeLength;
@@ -562,6 +587,9 @@ public class MediaDownloadService extends Service {
                                     initBytes = decInit;
                                 }
                             }
+                            if (cumulativeBytes.addAndGet(initBytes.length) > MAX_HLS_TOTAL_BYTES) {
+                                throw new IOException("HLS download exceeds maximum aggregate size limit (2 GiB)");
+                            }
                             bos.write(initBytes);
                             writtenInitKeys.put(initKeyId, Boolean.TRUE);
                         }
@@ -581,6 +609,10 @@ public class MediaDownloadService extends Service {
 
                     if (segFile == null || !segFile.exists() || segFile.length() <= 0) {
                         throw new IOException("Empty HLS segment " + (idx + 1) + "/" + total);
+                    }
+                    if (cumulativeBytes.addAndGet(segFile.length()) > MAX_HLS_TOTAL_BYTES) {
+                        segFile.delete();
+                        throw new IOException("HLS download exceeds maximum aggregate size limit (2 GiB)");
                     }
                     try (InputStream segIn = new BufferedInputStream(new FileInputStream(segFile), 64 * 1024)) {
                         int n;
@@ -715,6 +747,10 @@ public class MediaDownloadService extends Service {
                     return;
                 } else if (code == 200) {
                     if (hasRange) {
+                        if (byteRangeOffset > maxBytes || byteRangeOffset + byteRangeLength > maxBytes) {
+                            throw new IOException("Server ignored Range and offset+length ("
+                                    + (byteRangeOffset + byteRangeLength) + ") exceeds cap (" + maxBytes + ") for " + urlStr);
+                        }
                         long sliceStart = byteRangeOffset;
                         long written = streamBoundedToFile(sc.conn.getInputStream(), outFile, sliceStart, byteRangeLength, maxBytes);
                         if (written != byteRangeLength) {
@@ -761,7 +797,7 @@ public class MediaDownloadService extends Service {
                     throw new IOException("Download cancelled");
                 }
                 totalRead += n;
-                if (skipBytes <= 0 && exactTake < 0 && totalRead > maxTotalBytes) {
+                if (totalRead > maxTotalBytes) {
                     throw new IOException("Response exceeds maximum cap (" + maxTotalBytes + " bytes)");
                 }
                 long chunkStart = totalRead - n;
@@ -921,13 +957,12 @@ public class MediaDownloadService extends Service {
     }
 
     private void downloadDirectStream(MediaItem item, JobProgress jp) throws Exception {
-        String ext = item.type == MediaType.AUDIO ? ".mp3" : ".mp4";
-        String lowerUrl = item.url.toLowerCase(Locale.ROOT);
-        if (lowerUrl.contains(".webm")) ext = ".webm";
-        else if (lowerUrl.contains(".mkv")) ext = ".mkv";
+        String[] fmt = MediaItem.resolveContainerFormat(item.mimeType, item.url, item.type);
+        String ext = fmt[0];
+        String defaultMime = fmt[1];
 
         String filename = sanitizeFilename(item.title) + ext;
-        String mime = NetworkSafety.sanitizeMimeType(item.mimeType, (item.type == MediaType.AUDIO ? "audio/mpeg" : "video/mp4"));
+        String mime = NetworkSafety.sanitizeMimeType(item.mimeType, defaultMime);
         String refPage = (item.pageUrl != null && !item.pageUrl.isEmpty()) ? item.pageUrl : item.referer;
 
         Uri targetUri = null;
@@ -1039,33 +1074,27 @@ public class MediaDownloadService extends Service {
                 byte[] imgBytes = fetchRangeWithRetry(item.url, -1, -1, item, refPage, MAX_IMAGE_BYTES);
                 if (imgBytes == null || imgBytes.length == 0) continue;
 
-                boolean isWebp = item.url.toLowerCase(Locale.ROOT).contains(".webp") || item.mimeType.contains("webp");
+                boolean isWebp = item.url.toLowerCase(Locale.ROOT).contains(".webp")
+                        || (item.mimeType != null && item.mimeType.toLowerCase(Locale.ROOT).contains("webp"));
                 String filename;
                 String mimeType;
-                byte[] outputBytes;
+                String savedRef = null;
 
                 if (isWebp && convertWebp) {
-                    Bitmap bmp = ThumbnailLoader.decodeBoundedForConversion(imgBytes);
-                    if (bmp != null) {
-                        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                        boolean ok = bmp.compress(Bitmap.CompressFormat.PNG, 100, baos);
-                        bmp.recycle();
-                        if (ok && baos.size() > 0) {
-                            outputBytes = baos.toByteArray();
+                    File tmpPng = File.createTempFile("bulk_png_", ".png", getCacheDir());
+                    try {
+                        if (ThumbnailLoader.convertWebpBytesToPngFile(imgBytes, tmpPng)) {
+                            imgBytes = null; // Free encoded WebP bytes before writing out PNG
                             filename = sanitizeFilename(item.title) + "_" + (i + 1) + ".png";
-                            mimeType = "image/png";
+                            savedRef = saveFileToDestination(tmpPng, filename, "image/png", true);
                         } else {
-                            outputBytes = imgBytes;
                             filename = sanitizeFilename(item.title) + "_" + (i + 1) + ".webp";
-                            mimeType = "image/webp";
+                            savedRef = saveBytesToImageStore(imgBytes, filename, "image/webp");
                         }
-                    } else {
-                        outputBytes = imgBytes;
-                        filename = sanitizeFilename(item.title) + "_" + (i + 1) + ".webp";
-                        mimeType = "image/webp";
+                    } finally {
+                        if (tmpPng.exists()) tmpPng.delete();
                     }
                 } else {
-                    outputBytes = imgBytes;
                     String ext = ".jpg";
                     String lower = item.url.toLowerCase(Locale.ROOT);
                     if (lower.contains(".png")) ext = ".png";
@@ -1073,11 +1102,13 @@ public class MediaDownloadService extends Service {
                     else if (lower.contains(".gif")) ext = ".gif";
                     filename = sanitizeFilename(item.title) + "_" + (i + 1) + ext;
                     mimeType = NetworkSafety.sanitizeMimeType(item.mimeType, "image/jpeg");
+                    savedRef = saveBytesToImageStore(imgBytes, filename, mimeType);
                 }
 
-                String savedRef = saveBytesToImageStore(outputBytes, filename, mimeType);
-                savedCount++;
-                PatchPrefs.markMediaDownloaded(this, item.url, savedRef);
+                if (savedRef != null) {
+                    savedCount++;
+                    PatchPrefs.markMediaDownloaded(this, item.url, savedRef);
+                }
             } catch (Throwable t) {
                 Log.w(TAG, "Failed downloading image: " + item.url, t);
             }
@@ -1301,46 +1332,57 @@ public class MediaDownloadService extends Service {
         }
     }
 
-    private File resolveUniqueDestFile(File dir, String filename) {
-        File candidate = new File(dir, filename);
-        if (!candidate.exists()) return candidate;
-        int dot = filename.lastIndexOf('.');
-        String base = (dot > 0) ? filename.substring(0, dot) : filename;
-        String ext = (dot > 0) ? filename.substring(dot) : "";
-        for (int n = 1; n < 10000; n++) {
-            File alt = new File(dir, base + " (" + n + ")" + ext);
-            if (!alt.exists()) return alt;
+    /**
+     * Atomically reserves a collision-free destination path via createNewFile() (O_CREAT|O_EXCL)
+     * inside DEST_RESERVE_LOCK so concurrent workers can never race to overwrite one another.
+     */
+    private File reserveUniqueDestFile(File dir, String filename) throws IOException {
+        synchronized (DEST_RESERVE_LOCK) {
+            File candidate = new File(dir, filename);
+            if (candidate.createNewFile()) {
+                return candidate;
+            }
+            int dot = filename.lastIndexOf('.');
+            String base = (dot > 0) ? filename.substring(0, dot) : filename;
+            String ext = (dot > 0) ? filename.substring(dot) : "";
+            for (int n = 1; n < 10000; n++) {
+                File alt = new File(dir, base + " (" + n + ")" + ext);
+                if (alt.createNewFile()) {
+                    return alt;
+                }
+            }
+            for (int n = 0; n < 64; n++) {
+                File alt = new File(dir, base + "_" + UUID.randomUUID().toString().substring(0, 8) + ext);
+                if (alt.createNewFile()) {
+                    return alt;
+                }
+            }
+            throw new IOException("Exhausted unique destination names for " + filename);
         }
-        return new File(dir, base + "_" + System.currentTimeMillis() + ext);
     }
 
     private File finalizeTempFileToUniqueDest(File tempFile, File dir, String filename) throws IOException {
-        for (int attempt = 0; attempt < 32; attempt++) {
-            File dest = resolveUniqueDestFile(dir, filename);
-            if (tempFile.renameTo(dest)) {
-                return dest;
+        File reservedDest = reserveUniqueDestFile(dir, filename);
+        try {
+            if (tempFile.renameTo(reservedDest)) {
+                return reservedDest;
             }
-            if (!dest.exists()) {
-                // Rename failed across mount boundaries; only create brand-new file exclusively
-                if (dest.createNewFile()) {
-                    try (InputStream in = new FileInputStream(tempFile);
-                         OutputStream out = new FileOutputStream(dest)) {
-                        byte[] buf = new byte[32 * 1024];
-                        int r;
-                        while ((r = in.read(buf)) != -1) {
-                            out.write(buf, 0, r);
-                        }
-                        out.flush();
-                    } catch (IOException e) {
-                        dest.delete();
-                        throw e;
-                    }
-                    tempFile.delete();
-                    return dest;
+            // Fallback copy if atomic renameTo failed across mount points
+            try (InputStream in = new FileInputStream(tempFile);
+                 OutputStream out = new FileOutputStream(reservedDest)) {
+                byte[] buf = new byte[32 * 1024];
+                int r;
+                while ((r = in.read(buf)) != -1) {
+                    out.write(buf, 0, r);
                 }
+                out.flush();
             }
+            tempFile.delete();
+            return reservedDest;
+        } catch (IOException e) {
+            if (reservedDest.exists()) reservedDest.delete();
+            throw e;
         }
-        throw new IOException("Failed finalizing downloaded file into " + dir.getAbsolutePath());
     }
 
     /**

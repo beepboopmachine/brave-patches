@@ -555,12 +555,23 @@ public final class MediaSnifferJs {
         "    } catch(e) {}\n" +
         "  }\n" +
         "\n" +
+        "  function hashScriptText(s) {\n" +
+        "    var h1 = 0x811c9dc5 | 0;\n" +
+        "    var h2 = 0x9e3779b9 | 0;\n" +
+        "    for (var i = 0; i < s.length; i++) {\n" +
+        "      var c = s.charCodeAt(i);\n" +
+        "      h1 = Math.imul(h1 ^ c, 0x01000193);\n" +
+        "      h2 = Math.imul(h2 ^ (c + i), 0x85ebca6b);\n" +
+        "    }\n" +
+        "    return s.length + ':' + (h1 >>> 0) + ':' + (h2 >>> 0);\n" +
+        "  }\n" +
+        "\n" +
         "  function scanScriptElement(sc) {\n" +
         "    if (!sc) return;\n" +
         "    try {\n" +
         "      var stxt = sc.textContent;\n" +
         "      if (!stxt || stxt.length < 20 || stxt.length > MAX_TEXT_SCAN_LEN) return;\n" +
-        "      var sig = stxt.length + ':' + stxt.slice(0, 64) + ':' + stxt.slice(-64);\n" +
+        "      var sig = hashScriptText(stxt);\n" +
         "      if (scannedScripts) {\n" +
         "        if (scannedScripts.get(sc) === sig) return;\n" +
         "        scannedScripts.set(sc, sig);\n" +

@@ -265,6 +265,9 @@ public final class ActiveTabTracker {
             if (tab != null) {
                 int tId = tab.getId();
                 Activity tabAct = resolveTabActivity(tab);
+                if (tabAct != null) {
+                    dev.brave.extension.media.NetworkSafety.initContext(tabAct);
+                }
                 boolean isActiveGlobal = isCurrentlyActiveTab(tab, tId);
                 boolean isActiveInWindow = isCurrentlyActiveInWindow(tab, tId, tabAct);
                 if (sActiveTabRef.get() == null && sActiveTabId < 0) {

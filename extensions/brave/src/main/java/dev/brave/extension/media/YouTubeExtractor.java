@@ -128,11 +128,13 @@ public final class YouTubeExtractor {
             IN_FLIGHT.entrySet().removeIf(e -> (now - e.getValue()) > ENTRY_TTL_MS);
         }
 
+        final Long timestamp = Long.valueOf(now);
         Long prev = IN_FLIGHT.get(dedupKey);
         if (prev != null && (now - prev) < DEDUP_WINDOW_MS) return;
-        IN_FLIGHT.put(dedupKey, now);
+        IN_FLIGHT.put(dedupKey, timestamp);
 
-        POOL.execute(() -> {
+        try {
+            POOL.execute(() -> {
             boolean resolvedAny = false;
             try {
                 if (gen != MediaRegistry.getTabGeneration(tabId)) return;
@@ -271,10 +273,14 @@ public final class YouTubeExtractor {
                 Log.w(TAG, "YouTube extraction failed for " + videoId, t);
             } finally {
                 if (!resolvedAny) {
-                    IN_FLIGHT.remove(dedupKey);
+                    IN_FLIGHT.remove(dedupKey, timestamp);
                 }
             }
         });
+        } catch (java.util.concurrent.RejectedExecutionException ree) {
+            IN_FLIGHT.remove(dedupKey, timestamp);
+            Log.w(TAG, "YouTube resolver pool saturated; skipping " + videoId);
+        }
     }
 
     private static JSONObject fetchAndroidPlayerJson(String videoId) {

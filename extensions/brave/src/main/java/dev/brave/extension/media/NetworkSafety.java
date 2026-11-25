@@ -1,5 +1,11 @@
 package dev.brave.extension.media;
 
+import android.content.Context;
+import android.net.ConnectivityManager;
+import android.net.IpPrefix;
+import android.net.LinkProperties;
+import android.net.Network;
+import android.os.Build;
 import android.util.Log;
 import java.io.BufferedInputStream;
 import java.io.BufferedReader;
@@ -43,6 +49,14 @@ import javax.net.ssl.SSLSocketFactory;
 public final class NetworkSafety {
     private static final String TAG = "Brave_NetworkSafety";
     private static final int MAX_REDIRECTS = 5;
+    private static volatile Context sAppContext = null;
+
+    public static void initContext(Context ctx) {
+        if (ctx != null && sAppContext == null) {
+            Context app = ctx.getApplicationContext();
+            sAppContext = (app != null) ? app : ctx;
+        }
+    }
     private static final SecureRandom SECURE_RANDOM = new SecureRandom();
     public static final String DEFAULT_USER_AGENT =
             "Mozilla/5.0 (Linux; Android 14; Pixel 6a) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36";
@@ -256,10 +270,12 @@ public final class NetworkSafety {
     /**
      * Computes an eligible Cookie header value for targetUrl given the page/source URL
      * from which document.cookie was collected:
-     * - Blocks HTTPS -> HTTP scheme downgrade (protects Secure cookies)
-     * - Requires exact host match (case-insensitive) to prevent cross-origin cookie leakage
-     * - Enforces RFC 6265 cookie Path scoping so cookies collected on a subpath (e.g. /account/)
-     *   cannot be forwarded to sibling or parent paths (e.g. /media/)
+     * - Blocks HTTPS -> HTTP credential downgrade (protects Secure cookies)
+     * - Requires exact host match (case-insensitive) to prevent cross-host cookie leakage
+     *
+     * Note: cookieSourceUrl is a page URL rather than a Set-Cookie Path attribute, so page path
+     * matching is intentionally not applied (page paths like /watch/123 must not block host-wide
+     * cookies sent to /media/ endpoints on the same host).
      */
     public static String computeSafeCookie(String cookie, String cookieSourceUrl, String targetUrl) {
         if (cookie == null || cookie.isEmpty()
@@ -286,42 +302,10 @@ public final class NetworkSafety {
             if (!srcHost.equals(dstHost)) {
                 return "";
             }
-            String srcPath = normalizeCookiePath(srcUri);
-            String dstPath = normalizeCookiePath(dstUri);
-            if (!isCookiePathMatch(dstPath, srcPath)) {
-                return "";
-            }
             return cookie;
         } catch (Throwable ignored) {
             return "";
         }
-    }
-
-    private static String normalizeCookiePath(URI uri) {
-        URI norm = uri.normalize();
-        String path = norm.getRawPath();
-        if (path == null || path.isEmpty()) {
-            return "/";
-        }
-        return path;
-    }
-
-    /**
-     * RFC 6265 section 5.1.4 path-match: returns true only if requestPath matches cookieScopePath
-     * (either identical, or cookieScopePath is a directory prefix of requestPath).
-     */
-    private static boolean isCookiePathMatch(String requestPath, String cookieScopePath) {
-        if (requestPath.equals(cookieScopePath)) {
-            return true;
-        }
-        if (requestPath.startsWith(cookieScopePath)) {
-            if (cookieScopePath.endsWith("/")) {
-                return true;
-            }
-            return requestPath.length() > cookieScopePath.length()
-                    && requestPath.charAt(cookieScopePath.length()) == '/';
-        }
-        return false;
     }
 
     public static String normalizeHost(String rawHost) {
@@ -526,8 +510,92 @@ public final class NetworkSafety {
             if (b0 == 0x20 && b1 == 0x01 && b2 == 0x00 && b3 == 0x00) {
                 return true;
             }
+            // Dynamically discovered RFC 6052 NAT64 Network-Specific Prefixes (NSPs)
+            if (isNonPublicUnderActiveNat64Prefixes(raw)) {
+                return true;
+            }
         }
         return false;
+    }
+
+    private static List<byte[]> discoverActiveNat64Prefixes() {
+        Context ctx = sAppContext;
+        if (ctx == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            return Collections.emptyList();
+        }
+        List<byte[]> result = new ArrayList<>(2);
+        try {
+            Object obj = ctx.getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (!(obj instanceof ConnectivityManager)) return result;
+            ConnectivityManager cm = (ConnectivityManager) obj;
+            Network[] nets = cm.getAllNetworks();
+            if (nets == null) return result;
+            for (Network net : nets) {
+                LinkProperties lp = cm.getLinkProperties(net);
+                if (lp == null) continue;
+                IpPrefix nat64 = lp.getNat64Prefix();
+                if (nat64 == null) continue;
+                byte[] pBytes = nat64.getRawAddress();
+                int pLen = nat64.getPrefixLength();
+                if (pBytes != null && pBytes.length == 16 && isValidRfc6052PrefixLength(pLen)) {
+                    byte[] packed = new byte[17];
+                    System.arraycopy(pBytes, 0, packed, 0, 16);
+                    packed[16] = (byte) pLen;
+                    result.add(packed);
+                }
+            }
+        } catch (Throwable ignored) {}
+        return result;
+    }
+
+    private static boolean isValidRfc6052PrefixLength(int prefixLen) {
+        return prefixLen == 32 || prefixLen == 40 || prefixLen == 48
+                || prefixLen == 56 || prefixLen == 64 || prefixLen == 96;
+    }
+
+    private static boolean isNonPublicUnderActiveNat64Prefixes(byte[] raw) {
+        List<byte[]> active = discoverActiveNat64Prefixes();
+        for (byte[] packed : active) {
+            int pLen = packed[16] & 0xFF;
+            if (matchesRfc6052NspAndNonPublicIpv4(raw, packed, pLen)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Checks whether raw (16-byte IPv6 address) matches the given RFC 6052 Network-Specific Prefix
+     * (prefixLen in {32, 40, 48, 56, 64, 96}) and decodes its embedded IPv4 address for non-public check.
+     */
+    static boolean matchesRfc6052NspAndNonPublicIpv4(byte[] raw, byte[] prefixBytes, int prefixLen) {
+        if (raw == null || raw.length != 16 || prefixBytes == null || prefixBytes.length < 16) return false;
+        if (!isValidRfc6052PrefixLength(prefixLen)) return false;
+        int fullBytes = prefixLen / 8;
+        for (int i = 0; i < fullBytes; i++) {
+            if (raw[i] != prefixBytes[i]) return false;
+        }
+        byte[] v4 = extractRfc6052Ipv4(raw, prefixLen);
+        return v4 != null && isNonPublicIpv4(v4);
+    }
+
+    private static byte[] extractRfc6052Ipv4(byte[] raw, int prefixLen) {
+        switch (prefixLen) {
+            case 96:
+                return new byte[]{raw[12], raw[13], raw[14], raw[15]};
+            case 64:
+                return new byte[]{raw[9], raw[10], raw[11], raw[12]};
+            case 56:
+                return new byte[]{raw[7], raw[9], raw[10], raw[11]};
+            case 48:
+                return new byte[]{raw[6], raw[7], raw[9], raw[10]};
+            case 40:
+                return new byte[]{raw[5], raw[6], raw[7], raw[9]};
+            case 32:
+                return new byte[]{raw[4], raw[5], raw[6], raw[7]};
+            default:
+                return null;
+        }
     }
 
     private static boolean isNonPublicIpv4(byte[] ip) {

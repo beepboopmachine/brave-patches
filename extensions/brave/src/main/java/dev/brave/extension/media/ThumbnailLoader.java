@@ -8,7 +8,12 @@ import android.util.Log;
 import android.util.LruCache;
 import android.view.View;
 import android.widget.ImageView;
+import java.io.BufferedOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.OutputStream;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Semaphore;
 
 /**
  * Memory-capped thumbnail loader with LruCache, SSRF-safe fetching, strict-origin Referer,
@@ -26,6 +31,8 @@ public final class ThumbnailLoader {
 
     private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
     private static final ExecutorService THREAD_POOL = NetworkSafety.newBoundedPool(3, 512, "BraveThumbLoader");
+    // Limit simultaneous large WebP->PNG transcodes to avoid simultaneous multi-bitmap heap pressure
+    private static final Semaphore WEBP_CONVERT_SEMAPHORE = new Semaphore(1);
 
     private static final LruCache<String, Bitmap> CACHE;
 
@@ -103,6 +110,45 @@ public final class ThumbnailLoader {
             });
         } catch (java.util.concurrent.RejectedExecutionException ree) {
             Log.d(TAG, "Thumbnail pool busy, skipping thumb: " + cleanUrl);
+        }
+    }
+
+    /**
+     * Converts raw image bytes into a bounded Bitmap and streams PNG encoding directly to outFile
+     * (without buffering an entire PNG copy in heap) under a single-conversion semaphore.
+     * Returns true iff outFile exists and is non-empty.
+     */
+    public static boolean convertWebpBytesToPngFile(byte[] rawBytes, File outFile) {
+        if (rawBytes == null || rawBytes.length == 0 || outFile == null) return false;
+        boolean acquired = false;
+        try {
+            WEBP_CONVERT_SEMAPHORE.acquire();
+            acquired = true;
+            Bitmap bmp = decodeBoundedForConversion(rawBytes);
+            if (bmp == null) {
+                if (outFile.exists()) outFile.delete();
+                return false;
+            }
+            boolean compressed;
+            try (OutputStream os = new BufferedOutputStream(new FileOutputStream(outFile), 32 * 1024)) {
+                compressed = bmp.compress(Bitmap.CompressFormat.PNG, 100, os);
+                os.flush();
+            } finally {
+                bmp.recycle();
+            }
+            if (!compressed || outFile.length() <= 0) {
+                if (outFile.exists()) outFile.delete();
+                return false;
+            }
+            return true;
+        } catch (Throwable t) {
+            if (outFile.exists()) outFile.delete();
+            Log.w(TAG, "convertWebpBytesToPngFile failed: " + t.getMessage());
+            return false;
+        } finally {
+            if (acquired) {
+                WEBP_CONVERT_SEMAPHORE.release();
+            }
         }
     }
 

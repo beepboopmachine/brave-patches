@@ -226,6 +226,7 @@ public final class MediaPickerBottomSheet {
     public static void show(final Activity activity) {
         if (activity == null || activity.isFinishing()) return;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1 && activity.isDestroyed()) return;
+        NetworkSafety.initContext(activity);
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (activity.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
@@ -718,9 +719,22 @@ public final class MediaPickerBottomSheet {
 
         final DragSelectController dragController = new DragSelectController();
 
+        final long[] currentRenderedGen = new long[]{ MediaRegistry.getTabGeneration(tabId) };
         final java.util.Set<String> renderedVideoUrls = new java.util.HashSet<>();
         final java.util.Set<String> renderedImageUrls = new java.util.HashSet<>();
         final Runnable refreshDisplayedLists = () -> {
+            long latestGen = MediaRegistry.getTabGeneration(tabId);
+            if (latestGen != currentRenderedGen[0]) {
+                currentRenderedGen[0] = latestGen;
+                renderedVideoUrls.clear();
+                renderedImageUrls.clear();
+                selectedImages.clear();
+                imageCheckBoxes.clear();
+                imageRowViews.clear();
+                videoList.removeAllViews();
+                imageList.removeAllViews();
+            }
+
             List<MediaItem> latestVideos = MediaRegistry.getMediaForTab(tabId);
             List<MediaItem> latestImages = MediaRegistry.getImagesForTab(tabId);
 
@@ -1189,25 +1203,9 @@ public final class MediaPickerBottomSheet {
     }
 
     private static void startDirectDownloadNative(final Activity activity, final MediaItem item, final Button dlBtn, final boolean isDark) {
-        String ext = item.type == MediaType.AUDIO ? ".mp3" : ".mp4";
-        String defaultMime = item.type == MediaType.AUDIO ? "audio/mpeg" : "video/mp4";
-        String mimeLower = item.mimeType != null ? item.mimeType.toLowerCase(Locale.ROOT) : "";
-        String pathLower = extractPathLower(item.url);
-
-        if (mimeLower.contains("webm") || pathLower.endsWith(".webm")) { ext = ".webm"; defaultMime = "video/webm"; }
-        else if (mimeLower.contains("matroska") || pathLower.endsWith(".mkv")) { ext = ".mkv"; defaultMime = "video/x-matroska"; }
-        else if (mimeLower.contains("quicktime") || pathLower.endsWith(".mov")) { ext = ".mov"; defaultMime = "video/quicktime"; }
-        else if (mimeLower.contains("x-msvideo") || pathLower.endsWith(".avi")) { ext = ".avi"; defaultMime = "video/x-msvideo"; }
-        else if (mimeLower.contains("x-flv") || pathLower.endsWith(".flv") || pathLower.endsWith(".f4v")) { ext = ".flv"; defaultMime = "video/x-flv"; }
-        else if (mimeLower.contains("3gpp") || pathLower.endsWith(".3gp")) { ext = ".3gp"; defaultMime = "video/3gpp"; }
-        else if (mimeLower.equals("video/ogg") || pathLower.endsWith(".ogv")) { ext = ".ogv"; defaultMime = "video/ogg"; }
-        else if (mimeLower.equals("image/gif") || pathLower.endsWith(".gif")) { ext = ".gif"; defaultMime = "image/gif"; }
-        else if (mimeLower.equals("audio/mp4") || pathLower.endsWith(".m4a")) { ext = ".m4a"; defaultMime = "audio/mp4"; }
-        else if (mimeLower.equals("audio/aac") || pathLower.endsWith(".aac")) { ext = ".aac"; defaultMime = "audio/aac"; }
-        else if (mimeLower.equals("audio/ogg") || mimeLower.equals("audio/opus") || pathLower.endsWith(".ogg") || pathLower.endsWith(".opus")) { ext = ".ogg"; defaultMime = "audio/ogg"; }
-        else if (mimeLower.equals("audio/flac") || pathLower.endsWith(".flac")) { ext = ".flac"; defaultMime = "audio/flac"; }
-        else if (mimeLower.equals("audio/wav") || pathLower.endsWith(".wav")) { ext = ".wav"; defaultMime = "audio/wav"; }
-        else if (mimeLower.equals("video/mp4") || pathLower.endsWith(".mp4") || pathLower.endsWith(".m4v")) { ext = ".mp4"; defaultMime = "video/mp4"; }
+        String[] fmt = MediaItem.resolveContainerFormat(item.mimeType, item.url, item.type);
+        String ext = fmt[0];
+        String defaultMime = fmt[1];
 
         final String resolvedMime = NetworkSafety.sanitizeMimeType(item.mimeType, defaultMime);
         String clean = getCleanFileName(item.url);
@@ -1259,9 +1257,24 @@ public final class MediaPickerBottomSheet {
             return;
         }
 
-        // 1. Primary path: Stream via authenticated LocalDownloadRelay into Brave's native DownloadManager
+        // 1. Primary path: Stream via authenticated LocalDownloadRelay into Brave's native DownloadManager.
+        // If upstream returns HTTP 401/403 (e.g. HttpOnly session cookie missing from document.cookie),
+        // retry once directly via Chromium's native DownloadManager which attaches full Profile cookies.
+        final Runnable onAuthFallback = () -> {
+            new Handler(Looper.getMainLooper()).post(() -> {
+                String refPage = (item.pageUrl != null && !item.pageUrl.isEmpty()) ? item.pageUrl : item.referer;
+                boolean safe = NetworkSafety.isAllowedTargetUrl(item.url, refPage);
+                if (safe && triggerChromiumNativeDownload(activity, item.url)) {
+                    Toast.makeText(activity, "Retrying with Chromium session cookies: " + filename, Toast.LENGTH_SHORT).show();
+                    updateButtonOnRelayHandoff.accept(true);
+                } else {
+                    updateButtonOnRelayHandoff.accept(false);
+                }
+            });
+        };
+
         String relayUrl = LocalDownloadRelay.startRelay(
-                item, filename, resolvedMime, false,
+                item, filename, resolvedMime, false, onAuthFallback,
                 (transferred, actualServedName) -> updateButtonOnRelayHandoff.accept(transferred)
         );
 
@@ -1273,7 +1286,7 @@ public final class MediaPickerBottomSheet {
             LocalDownloadRelay.stopRelay(relayUrl);
         }
 
-        // 2. Secure Fallback: MediaDownloadService (SSRF DNS-pinned, scheme/path-scoped cookies, verified disk completion)
+        // 2. Secure Fallback: MediaDownloadService (SSRF DNS-pinned, scheme/host-scoped cookies, verified disk completion)
         item.trackingUrl = item.url;
         registerButtonCompletionCallback(item.url, activity, dlBtn, isDark);
         startMediaDownload(activity, item, dlBtn);

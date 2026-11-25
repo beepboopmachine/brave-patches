@@ -17,6 +17,7 @@ public class StartupHelper {
      */
     public static void cancelPendingBackgroundSyncJobs(Context context) {
         if (context == null || !sBgSyncCleaned.compareAndSet(false, true)) return;
+        dev.brave.extension.media.NetworkSafety.initContext(context);
         try {
             Object obj = context.getSystemService(Context.JOB_SCHEDULER_SERVICE);
             if (obj instanceof JobScheduler) {
