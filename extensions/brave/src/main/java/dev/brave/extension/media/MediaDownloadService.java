@@ -46,6 +46,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import javax.crypto.Cipher;
 import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
@@ -56,7 +58,11 @@ public class MediaDownloadService extends Service {
     private static final String CHANNEL_COMPLETE_ID = "brave_media_downloads_complete";
     private static final int FOREGROUND_NOTIF_ID = 4004;
 
-    private static final int MAX_PLAYLIST_CHARS = 2 * 1024 * 1024; // 2 MB
+    private static final int MAX_PLAYLIST_CHARS = HlsParser.MAX_PLAYLIST_CHARS; // 16M chars strict cap
+    private static final Pattern CONTENT_RANGE_PATTERN = Pattern.compile(
+            "bytes\\s+(\\d+)-(\\d+)/(\\d+|\\*)",
+            Pattern.CASE_INSENSITIVE
+    );
     private static final int MAX_KEY_BYTES = 1024; // 1 KB
     private static final int MAX_SEGMENT_BYTES = 32 * 1024 * 1024; // 32 MB per segment
     private static final int MAX_IMAGE_BYTES = 25 * 1024 * 1024; // 25 MB per image
@@ -337,8 +343,8 @@ public class MediaDownloadService extends Service {
 
         String refPage = (item.pageUrl != null && !item.pageUrl.isEmpty()) ? item.pageUrl : item.referer;
         NetworkSafety.TextFetchResult plResult = fetchTextSafe(playlistUrl, item, refPage);
-        if (plResult == null || plResult.body == null || plResult.body.isEmpty()) {
-            throw new IOException("Failed fetching HLS playlist");
+        if (plResult == null || plResult.body == null || plResult.body.isEmpty() || plResult.truncated) {
+            throw new IOException("Failed fetching complete HLS playlist");
         }
 
         String resolvedPlaylistUrl = plResult.finalUrl;
@@ -347,18 +353,20 @@ public class MediaDownloadService extends Service {
         // If the fetched playlist is actually a master playlist (e.g., master passed directly), resolve its best variant
         if (mediaPlaylistText.contains("#EXT-X-STREAM-INF:")) {
             List<MediaItem.HlsVariant> nestedVariants = HlsParser.parseMasterPlaylist(resolvedPlaylistUrl, mediaPlaylistText);
-            if (!nestedVariants.isEmpty()) {
-                Collections.sort(nestedVariants);
-                MediaItem.HlsVariant best = nestedVariants.get(0);
-                if (audioPlaylistUrl.isEmpty() && best.audioPlaylistUrl != null && !best.audioPlaylistUrl.isEmpty()) {
-                    audioPlaylistUrl = best.audioPlaylistUrl;
-                }
-                NetworkSafety.TextFetchResult varResult = fetchTextSafe(best.url, item, refPage);
-                if (varResult != null && varResult.body != null && !varResult.body.isEmpty()) {
-                    resolvedPlaylistUrl = varResult.finalUrl;
-                    mediaPlaylistText = varResult.body;
-                }
+            if (nestedVariants.isEmpty()) {
+                throw new IllegalStateException("No playable variants found in HLS master playlist");
             }
+            Collections.sort(nestedVariants);
+            MediaItem.HlsVariant best = nestedVariants.get(0);
+            if (audioPlaylistUrl.isEmpty() && best.audioPlaylistUrl != null && !best.audioPlaylistUrl.isEmpty()) {
+                audioPlaylistUrl = best.audioPlaylistUrl;
+            }
+            NetworkSafety.TextFetchResult varResult = fetchTextSafe(best.url, item, refPage);
+            if (varResult == null || varResult.body == null || varResult.body.isEmpty() || varResult.truncated) {
+                throw new IOException("Failed fetching complete HLS variant playlist: " + best.url);
+            }
+            resolvedPlaylistUrl = varResult.finalUrl;
+            mediaPlaylistText = varResult.body;
         }
 
         if (HlsParser.isIFramesOnlyPlaylist(mediaPlaylistText)) {
@@ -392,18 +400,20 @@ public class MediaDownloadService extends Service {
             // Download separate EXT-X-MEDIA audio rendition if present
             if (!audioPlaylistUrl.isEmpty()) {
                 NetworkSafety.TextFetchResult audioPl = fetchTextSafe(audioPlaylistUrl, item, refPage);
-                if (audioPl != null && audioPl.body != null && !audioPl.body.isEmpty()) {
-                    List<HlsParser.SegmentInfo> audioSegments = HlsParser.parseMediaPlaylist(audioPl.finalUrl, audioPl.body);
-                    if (!audioSegments.isEmpty()) {
-                        for (HlsParser.SegmentInfo seg : audioSegments) {
-                            if (seg.keyInfo != null && seg.keyInfo.isDrm()) {
-                                throw new UnsupportedOperationException("DRM protected audio rendition is not supported");
-                            }
-                        }
-                        concatenatedAudio = new File(tempDir, "stream_audio.ts");
-                        downloadHlsSegmentList(audioSegments, item, refPage, concatenatedAudio, jp, 65, 85, "audio");
+                if (audioPl == null || audioPl.body == null || audioPl.body.isEmpty() || audioPl.truncated) {
+                    throw new IOException("Failed fetching complete HLS audio rendition playlist: " + audioPlaylistUrl);
+                }
+                List<HlsParser.SegmentInfo> audioSegments = HlsParser.parseMediaPlaylist(audioPl.finalUrl, audioPl.body);
+                if (audioSegments.isEmpty()) {
+                    throw new IllegalStateException("No media segments found in HLS audio rendition playlist");
+                }
+                for (HlsParser.SegmentInfo seg : audioSegments) {
+                    if (seg.keyInfo != null && seg.keyInfo.isDrm()) {
+                        throw new UnsupportedOperationException("DRM protected audio rendition is not supported");
                     }
                 }
+                concatenatedAudio = new File(tempDir, "stream_audio.ts");
+                downloadHlsSegmentList(audioSegments, item, refPage, concatenatedAudio, jp, 65, 85, "audio");
             }
 
             if (mShuttingDown || Thread.currentThread().isInterrupted()) {
@@ -579,9 +589,16 @@ public class MediaDownloadService extends Service {
             int maxBytes
     ) throws Exception {
         IOException lastError = null;
-        String rangeHeader = (byteRangeLength > 0 && byteRangeOffset >= 0)
-                ? ("bytes=" + byteRangeOffset + "-" + (byteRangeOffset + byteRangeLength - 1))
-                : null;
+        boolean hasRange = byteRangeLength > 0 && byteRangeOffset >= 0;
+        long expectedEnd = -1;
+        String rangeHeader = null;
+        if (hasRange) {
+            if (byteRangeLength > maxBytes || byteRangeOffset > Long.MAX_VALUE - byteRangeLength) {
+                throw new IOException("Requested byte range out of bounds for " + urlStr);
+            }
+            expectedEnd = byteRangeOffset + byteRangeLength - 1;
+            rangeHeader = "bytes=" + byteRangeOffset + "-" + expectedEnd;
+        }
 
         for (int attempt = 1; attempt <= MAX_SEGMENT_RETRIES; attempt++) {
             if (mShuttingDown || Thread.currentThread().isInterrupted()) {
@@ -594,15 +611,58 @@ public class MediaDownloadService extends Service {
                         refPage, refPage, rangeHeader, false, 10000, 15000
                 );
                 int code = sc.responseCode;
-                if (code >= 200 && code < 300) {
-                    byte[] data = NetworkSafety.readBytesBounded(sc.conn.getInputStream(), maxBytes);
-                    if (rangeHeader != null && code == 200) {
-                        // Server ignored Range and sent full resource: slice requested byte range safely
-                        int start = (int) byteRangeOffset;
-                        int end = (int) Math.min(data.length, byteRangeOffset + byteRangeLength);
-                        if (start < 0 || start >= data.length || end <= start) {
-                            throw new IOException("Requested byte range out of bounds for " + urlStr);
+                if (code == 206) {
+                    if (!hasRange) {
+                        throw new IOException("Unexpected HTTP 206 without Range request for " + urlStr);
+                    }
+                    String contentRange = sc.conn.getHeaderField("Content-Range");
+                    if (contentRange == null || contentRange.trim().isEmpty()) {
+                        throw new IOException("HTTP 206 missing Content-Range header for " + urlStr);
+                    }
+                    Matcher crMatch = CONTENT_RANGE_PATTERN.matcher(contentRange.trim());
+                    if (!crMatch.matches()) {
+                        throw new IOException("Malformed Content-Range header '" + contentRange + "' for " + urlStr);
+                    }
+                    long respStart;
+                    long respEnd;
+                    try {
+                        respStart = Long.parseLong(crMatch.group(1));
+                        respEnd = Long.parseLong(crMatch.group(2));
+                    } catch (NumberFormatException nfe) {
+                        throw new IOException("Invalid Content-Range bounds '" + contentRange + "' for " + urlStr, nfe);
+                    }
+                    if (respStart != byteRangeOffset || respEnd != expectedEnd) {
+                        throw new IOException("Content-Range mismatch for " + urlStr + ": expected "
+                                + byteRangeOffset + "-" + expectedEnd + ", got " + contentRange);
+                    }
+                    String totalStr = crMatch.group(3);
+                    if (!"*".equals(totalStr)) {
+                        try {
+                            long respTotal = Long.parseLong(totalStr);
+                            if (respEnd >= respTotal) {
+                                throw new IOException("Content-Range end exceeds total length '" + contentRange + "' for " + urlStr);
+                            }
+                        } catch (NumberFormatException nfe) {
+                            throw new IOException("Invalid Content-Range total '" + contentRange + "' for " + urlStr, nfe);
                         }
+                    }
+
+                    byte[] data = NetworkSafety.readBytesBounded(sc.conn.getInputStream(), maxBytes);
+                    if (data.length != byteRangeLength) {
+                        throw new IOException("HTTP 206 length mismatch for " + urlStr + ": expected "
+                                + byteRangeLength + " bytes, got " + data.length);
+                    }
+                    return data;
+                } else if (code == 200) {
+                    byte[] data = NetworkSafety.readBytesBounded(sc.conn.getInputStream(), maxBytes);
+                    if (hasRange) {
+                        // Server ignored Range and sent full resource: validate & slice exact requested byte range
+                        if (byteRangeOffset >= data.length || byteRangeLength > (long) data.length - byteRangeOffset) {
+                            throw new IOException("HTTP 200 response too short (" + data.length
+                                    + " bytes) for requested byte range " + byteRangeOffset + "-" + expectedEnd + " of " + urlStr);
+                        }
+                        int start = (int) byteRangeOffset;
+                        int end = (int) (byteRangeOffset + byteRangeLength);
                         return Arrays.copyOfRange(data, start, end);
                     }
                     return data;
@@ -1047,7 +1107,7 @@ public class MediaDownloadService extends Service {
     }
 
     private NetworkSafety.TextFetchResult fetchTextSafe(String urlStr, MediaItem item, String refPage) throws IOException {
-        return NetworkSafety.fetchTextSafe(
+        return NetworkSafety.fetchTextStrict(
                 urlStr, item.userAgent, item.cookie, item.cookieSourceUrl,
                 refPage, refPage, MAX_PLAYLIST_CHARS, 12000
         );

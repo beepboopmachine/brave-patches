@@ -21,7 +21,7 @@ import org.json.JSONObject;
  */
 public class MediaBridge {
     private static final String TAG = "Brave_MediaBridge";
-    private static final int MAX_PLAYLIST_CHARS = 1024 * 1024; // 1 MB cap
+    private static final int MAX_PLAYLIST_CHARS = 4 * 1024 * 1024; // 4M chars strict cap
     private static final int MAX_JSON_PAYLOAD_CHARS = 64 * 1024; // 64 KB cap
     private static final ExecutorService PARSER_POOL = NetworkSafety.newBoundedPool(2, 32, "BraveHlsParser");
 
@@ -176,7 +176,7 @@ public class MediaBridge {
                     if (capturedGen != MediaRegistry.getTabGeneration(capturedTabId)) return;
                     if (!MediaRegistry.canAcceptMedia(capturedTabId, MediaType.HLS_STREAM)) return;
                     try {
-                        NetworkSafety.TextFetchResult res = NetworkSafety.fetchTextSafe(
+                        NetworkSafety.TextFetchResult res = NetworkSafety.fetchTextStrict(
                                 item.url, item.userAgent, item.cookie, item.cookieSourceUrl,
                                 item.pageUrl, item.pageUrl, MAX_PLAYLIST_CHARS, 8000
                         );
@@ -279,7 +279,7 @@ public class MediaBridge {
                     if (capturedGen != MediaRegistry.getTabGeneration(targetTab)) return;
                     if (!MediaRegistry.canAcceptMedia(targetTab, MediaType.HLS_STREAM)) return;
                     try {
-                        NetworkSafety.TextFetchResult res = NetworkSafety.fetchTextSafe(
+                        NetworkSafety.TextFetchResult res = NetworkSafety.fetchTextStrict(
                                 item.url, item.userAgent, item.cookie, item.cookieSourceUrl,
                                 item.pageUrl, item.pageUrl, MAX_PLAYLIST_CHARS, 8000
                         );

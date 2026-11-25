@@ -7,14 +7,19 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.Inet4Address;
 import java.net.Inet6Address;
 import java.net.InetAddress;
+import java.net.Socket;
 import java.net.URI;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -23,6 +28,13 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.GZIPInputStream;
+import javax.net.ssl.HostnameVerifier;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SNIHostName;
+import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLSession;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
 
 /**
  * Centralized SSRF defense, Referer/Cookie isolation, safe manual redirect handling,
@@ -52,10 +64,16 @@ public final class NetworkSafety {
     public static final class TextFetchResult {
         public final String finalUrl;
         public final String body;
+        public final boolean truncated;
 
         public TextFetchResult(String finalUrl, String body) {
+            this(finalUrl, body, false);
+        }
+
+        public TextFetchResult(String finalUrl, String body, boolean truncated) {
             this.finalUrl = finalUrl;
             this.body = body;
+            this.truncated = truncated;
         }
     }
 
@@ -176,6 +194,8 @@ public final class NetworkSafety {
      * from which document.cookie was collected:
      * - Blocks HTTPS -> HTTP scheme downgrade (protects Secure cookies)
      * - Requires exact host match (case-insensitive) to prevent cross-origin cookie leakage
+     * - Enforces RFC 6265 cookie Path scoping so cookies collected on a subpath (e.g. /account/)
+     *   cannot be forwarded to sibling or parent paths (e.g. /media/)
      */
     public static String computeSafeCookie(String cookie, String cookieSourceUrl, String targetUrl) {
         if (cookie == null || cookie.isEmpty()
@@ -202,10 +222,42 @@ public final class NetworkSafety {
             if (!srcHost.equals(dstHost)) {
                 return "";
             }
+            String srcPath = normalizeCookiePath(srcUri);
+            String dstPath = normalizeCookiePath(dstUri);
+            if (!isCookiePathMatch(dstPath, srcPath)) {
+                return "";
+            }
             return cookie;
         } catch (Throwable ignored) {
             return "";
         }
+    }
+
+    private static String normalizeCookiePath(URI uri) {
+        URI norm = uri.normalize();
+        String path = norm.getRawPath();
+        if (path == null || path.isEmpty()) {
+            return "/";
+        }
+        return path;
+    }
+
+    /**
+     * RFC 6265 section 5.1.4 path-match: returns true only if requestPath matches cookieScopePath
+     * (either identical, or cookieScopePath is a directory prefix of requestPath).
+     */
+    private static boolean isCookiePathMatch(String requestPath, String cookieScopePath) {
+        if (requestPath.equals(cookieScopePath)) {
+            return true;
+        }
+        if (requestPath.startsWith(cookieScopePath)) {
+            if (cookieScopePath.endsWith("/")) {
+                return true;
+            }
+            return requestPath.length() > cookieScopePath.length()
+                    && requestPath.charAt(cookieScopePath.length()) == '/';
+        }
+        return false;
     }
 
     public static String normalizeHost(String rawHost) {
@@ -220,11 +272,47 @@ public final class NetworkSafety {
         return h.isEmpty() ? null : h;
     }
 
+    public static boolean isLiteralIpAddress(String host) {
+        if (host == null || host.isEmpty()) return false;
+        String h = host.trim();
+        if (h.startsWith("[") && h.endsWith("]")) {
+            h = h.substring(1, h.length() - 1);
+        }
+        // Strict decimal dotted-quad IPv4 (no leading-zero octal ambiguity)
+        String[] parts = h.split("\\.", -1);
+        if (parts.length == 4) {
+            for (String p : parts) {
+                if (p.isEmpty() || p.length() > 3) return false;
+                if (p.length() > 1 && p.charAt(0) == '0') return false;
+                for (int i = 0; i < p.length(); i++) {
+                    char c = p.charAt(i);
+                    if (c < '0' || c > '9') return false;
+                }
+                int val = Integer.parseInt(p);
+                if (val < 0 || val > 255) return false;
+            }
+            return true;
+        }
+        // IPv6 literal (must contain ':' and only hex/colon/dot characters)
+        if (h.indexOf(':') >= 0) {
+            for (int i = 0; i < h.length(); i++) {
+                char c = h.charAt(i);
+                boolean ok = (c >= '0' && c <= '9')
+                        || (c >= 'a' && c <= 'f')
+                        || (c >= 'A' && c <= 'F')
+                        || c == ':' || c == '.';
+                if (!ok) return false;
+            }
+            return true;
+        }
+        return false;
+    }
+
     /**
      * Checks whether targetUrl is safe to connect to from native code without SSRF.
-     * Blocks loopback, private-network, link-local, multicast, CGNAT, and unspecified destinations
-     * UNLESS the originating page context itself is loaded from that exact same local host
-     * (preserving legitimate local LAN / 127.0.0.1 testing without allowing public-to-private SSRF).
+     * Always resolves DNS and verifies every address. Non-public destinations are blocked
+     * UNLESS the host is a non-rebindable literal IP or "localhost" on the exact same origin
+     * (scheme, host, and port) as pageContextUrl.
      */
     public static boolean isAllowedTargetUrl(String targetUrl, String pageContextUrl) {
         try {
@@ -237,6 +325,14 @@ public final class NetworkSafety {
     }
 
     public static void validateTargetUrl(String targetUrl, String pageContextUrl) throws IOException {
+        validateAndResolveTarget(targetUrl, pageContextUrl);
+    }
+
+    /**
+     * Validates targetUrl against SSRF rules and returns the validated resolved InetAddress array
+     * so callers can pin connections directly to those verified addresses without DNS TOCTOU.
+     */
+    public static InetAddress[] validateAndResolveTarget(String targetUrl, String pageContextUrl) throws IOException {
         if (targetUrl == null || targetUrl.trim().isEmpty()) {
             throw new IOException("Empty URL");
         }
@@ -261,27 +357,14 @@ public final class NetworkSafety {
             throw new IOException("Missing URL host");
         }
 
-        // Determine if this request is same-host with a locally-opened page (e.g. local QA server 127.0.0.1)
-        boolean sameHostAsLocalPage = false;
-        if (pageContextUrl != null && !pageContextUrl.isEmpty()) {
-            try {
-                URI pageUri = URI.create(pageContextUrl.trim());
-                String pageHost = normalizeHost(pageUri.getHost());
-                if (pageHost != null && pageHost.equals(host)) {
-                    sameHostAsLocalPage = true;
-                }
-            } catch (Throwable ignored) {}
-        }
-
-        if (sameHostAsLocalPage) {
-            // Still ensure basic sanity (no empty host / non-http scheme)
-            return;
-        }
-
-        if ("localhost".equals(host) || host.endsWith(".localhost") || host.endsWith(".local")) {
+        if (host.endsWith(".localhost") || host.endsWith(".local")) {
             throw new IOException("Blocked local hostname: " + host);
         }
 
+        boolean isLocalhost = "localhost".equals(host);
+        boolean isLiteralIp = isLiteralIpAddress(host);
+
+        // Always perform DNS resolution (never short-circuit before resolution)
         InetAddress[] addresses;
         try {
             addresses = InetAddress.getAllByName(host);
@@ -292,11 +375,32 @@ public final class NetworkSafety {
             throw new IOException("No addresses resolved for host: " + host);
         }
 
+        boolean hasNonPublic = false;
         for (InetAddress addr : addresses) {
             if (isNonPublicAddress(addr)) {
-                throw new IOException("Blocked non-public address " + addr.getHostAddress() + " for host " + host);
+                hasNonPublic = true;
+                break;
             }
         }
+
+        if (hasNonPublic || isLocalhost) {
+            // Only allow non-public / loopback targets when the page itself was opened on the exact
+            // same origin (scheme + host + port) AND the host cannot undergo external DNS rebinding.
+            boolean sameOrigin = pageContextUrl != null && !pageContextUrl.isEmpty()
+                    && isSameOrigin(pageContextUrl, targetUrl);
+            if (!sameOrigin || (!isLiteralIp && !isLocalhost)) {
+                throw new IOException("Blocked non-public destination for host " + host);
+            }
+            if (isLocalhost) {
+                for (InetAddress addr : addresses) {
+                    if (!addr.isLoopbackAddress()) {
+                        throw new IOException("Blocked non-loopback address " + addr.getHostAddress() + " for localhost");
+                    }
+                }
+            }
+        }
+
+        return addresses;
     }
 
     public static boolean isNonPublicAddress(InetAddress addr) {
@@ -358,7 +462,8 @@ public final class NetworkSafety {
     }
 
     /**
-     * Opens an HTTP(S) connection with manual redirect handling, validating every hop for SSRF
+     * Opens an HTTP(S) connection with manual redirect handling, validating every hop for SSRF,
+     * pinning the resolved IP address into the socket/URL connection to eliminate DNS TOCTOU,
      * and recomputing Referer and Cookie headers per hop.
      */
     public static SafeConnection openSafeConnection(
@@ -374,50 +479,96 @@ public final class NetworkSafety {
             int connectTimeoutMs,
             int readTimeoutMs
     ) throws IOException {
+        return openSafeConnectionInternal(
+                initialUrl, method, userAgent, cookie, cookieSourceUrl,
+                refererPageUrl, pageContextUrl, rangeHeader, acceptGzip,
+                null, null, null, connectTimeoutMs, readTimeoutMs
+        );
+    }
+
+    public static TextFetchResult postTextSafe(
+            String urlStr,
+            String contentType,
+            String body,
+            String userAgent,
+            String refererPageUrl,
+            String pageContextUrl,
+            String originHeader,
+            int maxChars,
+            int timeoutMs
+    ) throws IOException {
+        byte[] bodyBytes = body != null ? body.getBytes(StandardCharsets.UTF_8) : new byte[0];
+        SafeConnection sc = openSafeConnectionInternal(
+                urlStr, "POST", userAgent, "", "",
+                refererPageUrl, pageContextUrl, null, true,
+                contentType, bodyBytes, originHeader, timeoutMs, timeoutMs
+        );
+        try {
+            if (sc.responseCode < 200 || sc.responseCode >= 300) {
+                return null;
+            }
+            String encoding = sc.conn.getHeaderField("Content-Encoding");
+            boolean[] truncatedOut = new boolean[1];
+            String respBody = readTextInternal(sc.conn.getInputStream(), encoding, maxChars, false, truncatedOut);
+            return new TextFetchResult(sc.finalUrl, respBody, truncatedOut[0]);
+        } finally {
+            sc.conn.disconnect();
+        }
+    }
+
+    private static SafeConnection openSafeConnectionInternal(
+            String initialUrl,
+            String method,
+            String userAgent,
+            String cookie,
+            String cookieSourceUrl,
+            String refererPageUrl,
+            String pageContextUrl,
+            String rangeHeader,
+            boolean acceptGzip,
+            String contentType,
+            byte[] postBody,
+            String originHeader,
+            int connectTimeoutMs,
+            int readTimeoutMs
+    ) throws IOException {
         String currentUrl = initialUrl;
         String currentMethod = (method != null && !method.isEmpty()) ? method : "GET";
         String effectivePageContext = (pageContextUrl != null && !pageContextUrl.isEmpty())
                 ? pageContextUrl : refererPageUrl;
 
         for (int hop = 0; hop <= MAX_REDIRECTS; hop++) {
-            validateTargetUrl(currentUrl, effectivePageContext);
+            InetAddress[] validatedAddrs = validateAndResolveTarget(currentUrl, effectivePageContext);
+            List<InetAddress> orderedAddrs = orderAddressesPreferIpv4(validatedAddrs);
+            URL logicalUrl = new URL(currentUrl);
 
-            URL u = new URL(currentUrl);
-            HttpURLConnection conn = (HttpURLConnection) u.openConnection();
-            conn.setRequestMethod(currentMethod);
-            conn.setConnectTimeout(connectTimeoutMs);
-            conn.setReadTimeout(readTimeoutMs);
-            conn.setInstanceFollowRedirects(false);
-            conn.setRequestProperty("Accept", "*/*");
-            if (acceptGzip) {
-                conn.setRequestProperty("Accept-Encoding", "gzip");
+            HttpURLConnection conn = null;
+            int code = -1;
+            IOException lastConnectErr = null;
+            for (InetAddress pinnedAddr : orderedAddrs) {
+                HttpURLConnection candidate = openPinnedConnection(
+                        logicalUrl, pinnedAddr, currentMethod, userAgent,
+                        cookie, cookieSourceUrl, refererPageUrl, currentUrl,
+                        rangeHeader, acceptGzip, contentType, postBody, originHeader,
+                        connectTimeoutMs, readTimeoutMs
+                );
+                try {
+                    if (postBody != null && "POST".equalsIgnoreCase(currentMethod)) {
+                        candidate.setFixedLengthStreamingMode(postBody.length);
+                        try (OutputStream os = candidate.getOutputStream()) {
+                            os.write(postBody);
+                        }
+                    }
+                    code = candidate.getResponseCode();
+                    conn = candidate;
+                    break;
+                } catch (IOException e) {
+                    candidate.disconnect();
+                    lastConnectErr = e;
+                }
             }
-            if (userAgent != null && !userAgent.isEmpty()) {
-                conn.setRequestProperty("User-Agent", userAgent);
-            } else {
-                conn.setRequestProperty("User-Agent", DEFAULT_USER_AGENT);
-            }
-
-            String safeRef = computeSafeReferer(refererPageUrl, currentUrl);
-            if (!safeRef.isEmpty()) {
-                conn.setRequestProperty("Referer", safeRef);
-            }
-
-            String safeCookie = computeSafeCookie(cookie, cookieSourceUrl, currentUrl);
-            if (!safeCookie.isEmpty()) {
-                conn.setRequestProperty("Cookie", safeCookie);
-            }
-
-            if (rangeHeader != null && !rangeHeader.isEmpty()) {
-                conn.setRequestProperty("Range", rangeHeader);
-            }
-
-            int code;
-            try {
-                code = conn.getResponseCode();
-            } catch (IOException e) {
-                conn.disconnect();
-                throw e;
+            if (conn == null) {
+                throw (lastConnectErr != null) ? lastConnectErr : new IOException("Failed connecting to " + currentUrl);
             }
 
             if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
@@ -429,10 +580,12 @@ public final class NetworkSafety {
                 if (hop == MAX_REDIRECTS) {
                     throw new IOException("Too many redirects");
                 }
-                URL next = new URL(u, location.trim());
+                URL next = new URL(logicalUrl, location.trim());
                 currentUrl = next.toString();
-                if (code == 303 && !"HEAD".equalsIgnoreCase(currentMethod)) {
+                if ((code == 301 || code == 302 || code == 303) && !"HEAD".equalsIgnoreCase(currentMethod)) {
                     currentMethod = "GET";
+                    postBody = null;
+                    contentType = null;
                 }
                 continue;
             }
@@ -441,6 +594,172 @@ public final class NetworkSafety {
         }
 
         throw new IOException("Too many redirects");
+    }
+
+    private static List<InetAddress> orderAddressesPreferIpv4(InetAddress[] addresses) {
+        List<InetAddress> v4 = new ArrayList<>(addresses.length);
+        List<InetAddress> other = new ArrayList<>(addresses.length);
+        for (InetAddress addr : addresses) {
+            if (addr instanceof Inet4Address) {
+                v4.add(addr);
+            } else {
+                other.add(addr);
+            }
+        }
+        v4.addAll(other);
+        return v4;
+    }
+
+    private static String formatIpLiteralForUrl(InetAddress addr) {
+        String ip = addr.getHostAddress();
+        int pct = ip.indexOf('%');
+        if (pct >= 0) {
+            ip = ip.substring(0, pct);
+        }
+        return (addr instanceof Inet6Address) ? ("[" + ip + "]") : ip;
+    }
+
+    private static String stripBrackets(String host) {
+        if (host == null) return "";
+        if (host.startsWith("[") && host.endsWith("]")) {
+            return host.substring(1, host.length() - 1);
+        }
+        return host;
+    }
+
+    private static HttpURLConnection openPinnedConnection(
+            URL logicalUrl,
+            InetAddress pinnedAddr,
+            String method,
+            String userAgent,
+            String cookie,
+            String cookieSourceUrl,
+            String refererPageUrl,
+            String currentLogicalUrl,
+            String rangeHeader,
+            boolean acceptGzip,
+            String contentType,
+            byte[] postBody,
+            String originHeader,
+            int connectTimeoutMs,
+            int readTimeoutMs
+    ) throws IOException {
+        String pinnedHost = formatIpLiteralForUrl(pinnedAddr);
+        URL connectUrl = new URL(logicalUrl.getProtocol(), pinnedHost, logicalUrl.getPort(), logicalUrl.getFile());
+        HttpURLConnection conn = (HttpURLConnection) connectUrl.openConnection();
+
+        String logicalHost = logicalUrl.getHost();
+        String hostHeader = (logicalUrl.getPort() != -1) ? (logicalHost + ":" + logicalUrl.getPort()) : logicalHost;
+        conn.setRequestMethod(method);
+        conn.setConnectTimeout(connectTimeoutMs);
+        conn.setReadTimeout(readTimeoutMs);
+        conn.setInstanceFollowRedirects(false);
+        conn.setRequestProperty("Host", hostHeader);
+        conn.setRequestProperty("Accept", "*/*");
+        if (acceptGzip) {
+            conn.setRequestProperty("Accept-Encoding", "gzip");
+        }
+        if (userAgent != null && !userAgent.isEmpty()) {
+            conn.setRequestProperty("User-Agent", userAgent);
+        } else {
+            conn.setRequestProperty("User-Agent", DEFAULT_USER_AGENT);
+        }
+        if (contentType != null && !contentType.isEmpty()) {
+            conn.setRequestProperty("Content-Type", contentType);
+        }
+        if (originHeader != null && !originHeader.isEmpty()) {
+            conn.setRequestProperty("Origin", originHeader);
+        }
+        if (postBody != null && "POST".equalsIgnoreCase(method)) {
+            conn.setDoOutput(true);
+        }
+
+        String safeRef = computeSafeReferer(refererPageUrl, currentLogicalUrl);
+        if (!safeRef.isEmpty()) {
+            conn.setRequestProperty("Referer", safeRef);
+        }
+
+        String safeCookie = computeSafeCookie(cookie, cookieSourceUrl, currentLogicalUrl);
+        if (!safeCookie.isEmpty()) {
+            conn.setRequestProperty("Cookie", safeCookie);
+        }
+
+        if (rangeHeader != null && !rangeHeader.isEmpty()) {
+            conn.setRequestProperty("Range", rangeHeader);
+        }
+
+        if (conn instanceof HttpsURLConnection) {
+            HttpsURLConnection httpsConn = (HttpsURLConnection) conn;
+            final String sniHost = stripBrackets(logicalHost);
+            if (!isLiteralIpAddress(sniHost)) {
+                httpsConn.setSSLSocketFactory(
+                        new SniPinnedSSLSocketFactory(HttpsURLConnection.getDefaultSSLSocketFactory(), sniHost)
+                );
+            }
+            httpsConn.setHostnameVerifier(new HostnameVerifier() {
+                @Override
+                public boolean verify(String hostname, SSLSession session) {
+                    return HttpsURLConnection.getDefaultHostnameVerifier().verify(sniHost, session);
+                }
+            });
+        }
+
+        return conn;
+    }
+
+    private static final class SniPinnedSSLSocketFactory extends SSLSocketFactory {
+        private final SSLSocketFactory delegate;
+        private final String sniHost;
+
+        SniPinnedSSLSocketFactory(SSLSocketFactory delegate, String sniHost) {
+            this.delegate = delegate;
+            this.sniHost = sniHost;
+        }
+
+        private Socket configureSni(Socket sock) {
+            if (sock instanceof SSLSocket && sniHost != null && !sniHost.isEmpty()) {
+                SSLSocket ssl = (SSLSocket) sock;
+                SSLParameters params = ssl.getSSLParameters();
+                params.setServerNames(Collections.singletonList(new SNIHostName(sniHost)));
+                ssl.setSSLParameters(params);
+            }
+            return sock;
+        }
+
+        @Override
+        public String[] getDefaultCipherSuites() {
+            return delegate.getDefaultCipherSuites();
+        }
+
+        @Override
+        public String[] getSupportedCipherSuites() {
+            return delegate.getSupportedCipherSuites();
+        }
+
+        @Override
+        public Socket createSocket(Socket s, String host, int port, boolean autoClose) throws IOException {
+            return configureSni(delegate.createSocket(s, host, port, autoClose));
+        }
+
+        @Override
+        public Socket createSocket(String host, int port) throws IOException {
+            return configureSni(delegate.createSocket(host, port));
+        }
+
+        @Override
+        public Socket createSocket(String host, int port, InetAddress localHost, int localPort) throws IOException {
+            return configureSni(delegate.createSocket(host, port, localHost, localPort));
+        }
+
+        @Override
+        public Socket createSocket(InetAddress host, int port) throws IOException {
+            return configureSni(delegate.createSocket(host, port));
+        }
+
+        @Override
+        public Socket createSocket(InetAddress address, int port, InetAddress localAddress, int localPort) throws IOException {
+            return configureSni(delegate.createSocket(address, port, localAddress, localPort));
+        }
     }
 
     public static TextFetchResult fetchTextSafe(
@@ -453,6 +772,39 @@ public final class NetworkSafety {
             int maxChars,
             int timeoutMs
     ) throws IOException {
+        return fetchTextInternal(
+                urlStr, userAgent, cookie, cookieSourceUrl,
+                refererPageUrl, pageContextUrl, maxChars, timeoutMs, false
+        );
+    }
+
+    public static TextFetchResult fetchTextStrict(
+            String urlStr,
+            String userAgent,
+            String cookie,
+            String cookieSourceUrl,
+            String refererPageUrl,
+            String pageContextUrl,
+            int maxChars,
+            int timeoutMs
+    ) throws IOException {
+        return fetchTextInternal(
+                urlStr, userAgent, cookie, cookieSourceUrl,
+                refererPageUrl, pageContextUrl, maxChars, timeoutMs, true
+        );
+    }
+
+    private static TextFetchResult fetchTextInternal(
+            String urlStr,
+            String userAgent,
+            String cookie,
+            String cookieSourceUrl,
+            String refererPageUrl,
+            String pageContextUrl,
+            int maxChars,
+            int timeoutMs,
+            boolean throwOnExceed
+    ) throws IOException {
         SafeConnection sc = openSafeConnection(
                 urlStr, "GET", userAgent, cookie, cookieSourceUrl,
                 refererPageUrl, pageContextUrl, null, true, timeoutMs, timeoutMs
@@ -462,8 +814,9 @@ public final class NetworkSafety {
                 return null;
             }
             String encoding = sc.conn.getHeaderField("Content-Encoding");
-            String body = readTextBounded(sc.conn.getInputStream(), encoding, maxChars);
-            return new TextFetchResult(sc.finalUrl, body);
+            boolean[] truncatedOut = new boolean[1];
+            String body = readTextInternal(sc.conn.getInputStream(), encoding, maxChars, throwOnExceed, truncatedOut);
+            return new TextFetchResult(sc.finalUrl, body, truncatedOut[0]);
         } finally {
             sc.conn.disconnect();
         }
@@ -487,6 +840,23 @@ public final class NetworkSafety {
     }
 
     public static String readTextBounded(InputStream is, String contentEncoding, int maxChars) throws IOException {
+        return readTextInternal(is, contentEncoding, maxChars, false, null);
+    }
+
+    public static String readTextStrict(InputStream is, String contentEncoding, int maxChars) throws IOException {
+        return readTextInternal(is, contentEncoding, maxChars, true, null);
+    }
+
+    private static String readTextInternal(
+            InputStream is,
+            String contentEncoding,
+            int maxChars,
+            boolean throwOnExceed,
+            boolean[] truncatedOut
+    ) throws IOException {
+        if (maxChars < 0) {
+            throw new IllegalArgumentException("maxChars must be >= 0");
+        }
         InputStream stream = is;
         if (contentEncoding != null && "gzip".equalsIgnoreCase(contentEncoding.trim())) {
             stream = new GZIPInputStream(stream);
@@ -498,8 +868,14 @@ public final class NetworkSafety {
             int total = 0;
             while ((r = reader.read(buf)) != -1) {
                 if (total + r > maxChars) {
+                    if (throwOnExceed) {
+                        throw new IOException("Response exceeded size limit of " + maxChars + " chars");
+                    }
                     int allowed = maxChars - total;
                     if (allowed > 0) sb.append(buf, 0, allowed);
+                    if (truncatedOut != null && truncatedOut.length > 0) {
+                        truncatedOut[0] = true;
+                    }
                     break;
                 }
                 sb.append(buf, 0, r);

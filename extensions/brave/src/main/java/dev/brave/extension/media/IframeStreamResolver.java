@@ -2,10 +2,6 @@ package dev.brave.extension.media;
 
 import android.net.Uri;
 import android.util.Log;
-import java.io.OutputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
@@ -25,6 +21,7 @@ import org.json.JSONObject;
 public final class IframeStreamResolver {
     private static final String TAG = "Brave_IframeResolver";
     private static final int MAX_HTML_CHARS = 1024 * 1024; // 1 MB cap
+    private static final int MAX_PLAYLIST_CHARS = 4 * 1024 * 1024; // 4M chars strict cap
     private static final int MAX_NESTED_PER_LEVEL = 5;
     private static final int MAX_NESTED_TOTAL = 10;
     private static final long FAILED_RETRY_COOLDOWN_MS = 15_000L;
@@ -466,7 +463,10 @@ public final class IframeStreamResolver {
 
         if (type == MediaType.HLS_STREAM) {
             try {
-                NetworkSafety.TextFetchResult plRes = fetchContentSafe(streamUrl, effectivePage, pageContextUrl);
+                NetworkSafety.TextFetchResult plRes = NetworkSafety.fetchTextStrict(
+                        streamUrl, NetworkSafety.DEFAULT_USER_AGENT, "", "",
+                        effectivePage, pageContextUrl, MAX_PLAYLIST_CHARS, 8000
+                );
                 if (gen != MediaRegistry.getTabGeneration(targetTab)) return;
                 if (plRes != null && plRes.body != null && !plRes.body.isEmpty()) {
                     String playlist = plRes.body;
@@ -546,43 +546,15 @@ public final class IframeStreamResolver {
     }
 
     private static String postBodySafe(String urlStr, String contentType, String body, String referer, String pageContextUrl) {
-        HttpURLConnection conn = null;
         try {
-            NetworkSafety.validateTargetUrl(urlStr, pageContextUrl);
-            URL url = new URL(urlStr);
-            conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestMethod("POST");
-            conn.setConnectTimeout(8000);
-            conn.setReadTimeout(8000);
-            conn.setInstanceFollowRedirects(false);
-            conn.setDoOutput(true);
-            conn.setRequestProperty("Content-Type", contentType);
-            conn.setRequestProperty("User-Agent", NetworkSafety.DEFAULT_USER_AGENT);
-            conn.setRequestProperty("Accept-Encoding", "gzip");
-            String safeRef = NetworkSafety.computeSafeReferer(referer, urlStr);
-            if (!safeRef.isEmpty()) {
-                conn.setRequestProperty("Referer", safeRef);
-            }
             String origin = NetworkSafety.formatOrigin(referer);
-            if (origin != null) {
-                conn.setRequestProperty("Origin", origin);
-            }
-
-            byte[] input = body.getBytes(StandardCharsets.UTF_8);
-            conn.setFixedLengthStreamingMode(input.length);
-            try (OutputStream os = conn.getOutputStream()) {
-                os.write(input);
-            }
-
-            int code = conn.getResponseCode();
-            if (code >= 200 && code < 300) {
-                String encoding = conn.getHeaderField("Content-Encoding");
-                return NetworkSafety.readTextBounded(conn.getInputStream(), encoding, MAX_HTML_CHARS);
-            }
+            NetworkSafety.TextFetchResult res = NetworkSafety.postTextSafe(
+                    urlStr, contentType, body, NetworkSafety.DEFAULT_USER_AGENT,
+                    referer, pageContextUrl, origin, MAX_HTML_CHARS, 8000
+            );
+            return res != null ? res.body : null;
         } catch (Throwable ignored) {
-        } finally {
-            if (conn != null) conn.disconnect();
+            return null;
         }
-        return null;
     }
 }

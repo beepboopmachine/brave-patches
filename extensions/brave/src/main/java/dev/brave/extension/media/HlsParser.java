@@ -2,6 +2,7 @@ package dev.brave.extension.media;
 
 import android.util.Log;
 import java.io.BufferedReader;
+import java.io.IOException;
 import java.io.StringReader;
 import java.net.URL;
 import java.util.ArrayList;
@@ -13,6 +14,8 @@ import java.util.regex.Pattern;
 
 public final class HlsParser {
     private static final String TAG = "Brave_HlsParser";
+
+    public static final int MAX_PLAYLIST_CHARS = 16 * 1024 * 1024; // 16M chars safety cap
 
     // Match BANDWIDTH= after start, ':', or ',' (still excludes AVERAGE-BANDWIDTH=)
     private static final Pattern BANDWIDTH_PATTERN = Pattern.compile("(?:^|[:,])BANDWIDTH=(\\d+)");
@@ -111,6 +114,9 @@ public final class HlsParser {
     public static List<MediaItem.HlsVariant> parseMasterPlaylist(String baseUrl, String playlistText) {
         List<MediaItem.HlsVariant> variants = new ArrayList<>();
         if (playlistText == null || playlistText.isEmpty()) return variants;
+        if (playlistText.length() > MAX_PLAYLIST_CHARS) {
+            throw new IllegalArgumentException("HLS master playlist exceeds maximum allowed length");
+        }
 
         // First pass: collect EXT-X-MEDIA TYPE=AUDIO renditions by GROUP-ID
         // Priority: DEFAULT=YES (3) > AUTOSELECT=YES (2) > first available (1)
@@ -142,8 +148,8 @@ public final class HlsParser {
                     }
                 }
             }
-        } catch (Exception e) {
-            Log.e(TAG, "Error scanning EXT-X-MEDIA audio groups", e);
+        } catch (IOException e) {
+            throw new IllegalStateException("Error scanning EXT-X-MEDIA audio groups", e);
         }
 
         // Second pass: parse EXT-X-STREAM-INF variants
@@ -203,8 +209,11 @@ public final class HlsParser {
                     }
                 }
             }
-        } catch (Exception e) {
-            Log.e(TAG, "Error parsing master playlist", e);
+            if (expectVariantUri) {
+                throw new IllegalArgumentException("Truncated HLS master playlist: trailing EXT-X-STREAM-INF without URI");
+            }
+        } catch (IOException e) {
+            throw new IllegalStateException("Error parsing master playlist", e);
         }
 
         return variants;
@@ -218,6 +227,9 @@ public final class HlsParser {
     public static List<SegmentInfo> parseMediaPlaylist(String baseUrl, String playlistText) {
         List<SegmentInfo> segments = new ArrayList<>();
         if (playlistText == null || playlistText.isEmpty()) return segments;
+        if (playlistText.length() > MAX_PLAYLIST_CHARS) {
+            throw new IllegalArgumentException("HLS media playlist exceeds maximum allowed length");
+        }
 
         try (BufferedReader reader = new BufferedReader(new StringReader(playlistText))) {
             String line;
@@ -282,16 +294,19 @@ public final class HlsParser {
                     currentKey = new KeyInfo(method, keyUri, iv);
                 } else if (line.startsWith("#EXT-X-BYTERANGE:")) {
                     Matcher brMatch = BYTERANGE_PATTERN.matcher(line);
-                    if (brMatch.find()) {
-                        try {
-                            nextByteRangeLen = Long.parseLong(brMatch.group(1));
-                            nextByteRangeOff = (brMatch.group(2) != null)
-                                    ? Long.parseLong(brMatch.group(2))
-                                    : -1L; // Resolved against previous segment's end when URI line is read
-                        } catch (Exception ignored) {
-                            nextByteRangeLen = -1;
-                            nextByteRangeOff = -1;
-                        }
+                    if (!brMatch.matches()) {
+                        throw new IllegalArgumentException("Malformed EXT-X-BYTERANGE tag: " + line);
+                    }
+                    try {
+                        nextByteRangeLen = Long.parseLong(brMatch.group(1));
+                        nextByteRangeOff = (brMatch.group(2) != null)
+                                ? Long.parseLong(brMatch.group(2))
+                                : -1L; // Resolved against immediately preceding ranged segment when URI line is read
+                    } catch (NumberFormatException nfe) {
+                        throw new IllegalArgumentException("Invalid EXT-X-BYTERANGE values: " + line, nfe);
+                    }
+                    if (nextByteRangeLen <= 0) {
+                        throw new IllegalArgumentException("EXT-X-BYTERANGE length must be > 0: " + line);
                     }
                 } else if (line.startsWith("#EXTINF:")) {
                     expectSegmentUri = true;
@@ -310,10 +325,24 @@ public final class HlsParser {
                         long segBrOff = nextByteRangeOff;
                         if (segBrLen > 0) {
                             if (segBrOff < 0) {
-                                segBrOff = resolvedUrl.equals(lastByteRangeUri) ? lastByteRangeEnd : 0L;
+                                // RFC 8216 section 4.3.2.2: implicit offset requires the immediately
+                                // preceding Media Segment to be a sub-range of the same media resource.
+                                if (lastByteRangeUri == null || !resolvedUrl.equals(lastByteRangeUri)) {
+                                    throw new IllegalArgumentException(
+                                            "EXT-X-BYTERANGE without offset requires immediately preceding byte-range segment of same URI: " + resolvedUrl
+                                    );
+                                }
+                                segBrOff = lastByteRangeEnd;
+                            }
+                            if (segBrOff > Long.MAX_VALUE - segBrLen) {
+                                throw new IllegalArgumentException("EXT-X-BYTERANGE offset+length overflow");
                             }
                             lastByteRangeEnd = segBrOff + segBrLen;
                             lastByteRangeUri = resolvedUrl;
+                        } else {
+                            // Ordinary non-ranged segment invalidates implicit byte-range continuity
+                            lastByteRangeUri = null;
+                            lastByteRangeEnd = 0L;
                         }
 
                         segments.add(new SegmentInfo(
@@ -338,8 +367,11 @@ public final class HlsParser {
                     }
                 }
             }
-        } catch (Exception e) {
-            Log.e(TAG, "Error parsing media playlist", e);
+            if (expectSegmentUri || nextByteRangeLen > 0) {
+                throw new IllegalArgumentException("Truncated HLS media playlist: trailing segment tag without URI");
+            }
+        } catch (IOException e) {
+            throw new IllegalStateException("Error parsing media playlist", e);
         }
 
         return segments;
