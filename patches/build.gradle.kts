@@ -15,10 +15,10 @@ patches {
     about {
         name = "Brave Patches"
         description = "Brave Browser enhancements, privacy hardening, and native Media & HLS Downloader."
-        source = "https://github.com/brave/brave-browser"
-        author = "Brave Morphe Team"
-        contact = "https://github.com/brave/brave-browser/issues"
-        website = "https://brave.com"
+        source = "https://github.com/beepboopmachine/brave-patches"
+        author = "beepboopmachine"
+        contact = "https://github.com/beepboopmachine/brave-patches/issues"
+        website = "https://github.com/beepboopmachine/brave-patches"
         license = "GPLv3"
     }
 }

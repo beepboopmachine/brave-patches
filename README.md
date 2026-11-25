@@ -66,7 +66,19 @@ To regenerate `patches-list.json` after editing patches:
 
 ---
 
-## Patching Brave
+## Using in Morphe Manager (Android)
+
+1. Open **Morphe Manager** -> **Sources** -> **+** (`Add source`).
+2. Paste the repository URL:
+   ```
+   https://github.com/beepboopmachine/brave-patches
+   ```
+   Or tap the deep link: `https://morphe.software/add-source?github=beepboopmachine/brave-patches`
+3. Tap **Add**. Morphe reads `patches-bundle.json` and downloads `patches-1.0.0.mpp` from GitHub Releases.
+
+---
+
+## Patching Brave (CLI)
 
 1. Grab a clean **Brave Browser v1.100.58** APK/APKM (`com.brave.browser`).
 2. Build `patches-1.0.0.mpp` (or download it from Releases if available).
