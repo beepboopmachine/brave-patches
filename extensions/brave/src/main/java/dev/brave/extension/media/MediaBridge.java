@@ -86,6 +86,14 @@ public class MediaBridge {
     }
 
     @JavascriptInterface
+    public boolean isCategoryFull(String token, String typeStr) {
+        if (!isAuthorized(token)) return false;
+        int tabId = resolveBoundTabId();
+        MediaType type = "IMAGE".equalsIgnoreCase(typeStr) ? MediaType.IMAGE : MediaType.VIDEO;
+        return !MediaRegistry.canAcceptMedia(tabId, type);
+    }
+
+    @JavascriptInterface
     public void onIframeDetected(String token, String iframeUrl, String pageUrl) {
         if (!isAuthorized(token)) {
             Log.w(TAG, "Rejected unauthorized onIframeDetected call");
@@ -138,7 +146,9 @@ public class MediaBridge {
 
             String typeStr = obj.optString("type", "VIDEO").toUpperCase(Locale.ROOT);
             String title = obj.optString("title", "");
-            String mimeType = obj.optString("mimeType", "").toLowerCase(Locale.ROOT);
+            String rawMime = obj.optString("mimeType", "");
+            String mimeType = NetworkSafety.sanitizeMimeType(rawMime, "");
+            if (rawMime.isEmpty()) mimeType = "";
             long size = obj.optLong("size", 0);
             int width = obj.optInt("width", 0);
             int height = obj.optInt("height", 0);
@@ -172,34 +182,38 @@ public class MediaBridge {
             item.pageUrl = effectivePageUrl;
 
             if (type == MediaType.HLS_STREAM) {
-                PARSER_POOL.execute(() -> {
-                    if (capturedGen != MediaRegistry.getTabGeneration(capturedTabId)) return;
-                    if (!MediaRegistry.canAcceptMedia(capturedTabId, MediaType.HLS_STREAM)) return;
-                    try {
-                        NetworkSafety.TextFetchResult res = NetworkSafety.fetchTextStrict(
-                                item.url, item.userAgent, item.cookie, item.cookieSourceUrl,
-                                item.pageUrl, item.pageUrl, MAX_PLAYLIST_CHARS, 8000
-                        );
-                        if (res != null && res.body != null && !res.body.isEmpty()) {
-                            String playlistContent = res.body;
-                            if (playlistContent.contains("#EXT-X-KEY:") &&
-                                    (playlistContent.contains("SAMPLE-AES") || playlistContent.contains("KEYFORMAT=\"urn:uuid:"))) {
-                                Log.i(TAG, "Ignoring DRM-protected HLS stream: " + item.url);
-                                return;
+                try {
+                    PARSER_POOL.execute(() -> {
+                        if (capturedGen != MediaRegistry.getTabGeneration(capturedTabId)) return;
+                        if (!MediaRegistry.canAcceptMedia(capturedTabId, MediaType.HLS_STREAM)) return;
+                        try {
+                            NetworkSafety.TextFetchResult res = NetworkSafety.fetchTextStrict(
+                                    item.url, item.userAgent, item.cookie, item.cookieSourceUrl,
+                                    item.pageUrl, item.pageUrl, MAX_PLAYLIST_CHARS, 8000
+                            );
+                            if (res != null && res.body != null && !res.body.isEmpty()) {
+                                String playlistContent = res.body;
+                                if (HlsParser.hasUnsupportedEncryption(playlistContent)) {
+                                    Log.i(TAG, "Ignoring DRM/unsupported encrypted HLS stream: " + item.url);
+                                    return;
+                                }
+                                if (HlsParser.isIFramesOnlyPlaylist(playlistContent)) {
+                                    Log.i(TAG, "Ignoring I-frames-only HLS playlist: " + item.url);
+                                    return;
+                                }
+                                List<MediaItem.HlsVariant> variants = HlsParser.parseMasterPlaylist(res.finalUrl, playlistContent);
+                                Collections.sort(variants);
+                                item.variants.addAll(variants);
                             }
-                            if (HlsParser.isIFramesOnlyPlaylist(playlistContent)) {
-                                Log.i(TAG, "Ignoring I-frames-only HLS playlist: " + item.url);
-                                return;
-                            }
-                            List<MediaItem.HlsVariant> variants = HlsParser.parseMasterPlaylist(res.finalUrl, playlistContent);
-                            Collections.sort(variants);
-                            item.variants.addAll(variants);
+                        } catch (Throwable t) {
+                            Log.w(TAG, "Failed parsing HLS master playlist for " + item.url, t);
                         }
-                    } catch (Throwable t) {
-                        Log.w(TAG, "Failed parsing HLS master playlist for " + item.url, t);
-                    }
+                        MediaRegistry.addMediaItem(capturedTabId, capturedGen, item);
+                    });
+                } catch (java.util.concurrent.RejectedExecutionException ree) {
+                    Log.w(TAG, "HLS parser pool full; registering unparsed item for " + item.url);
                     MediaRegistry.addMediaItem(capturedTabId, capturedGen, item);
-                });
+                }
             } else {
                 boolean added = MediaRegistry.addMediaItem(capturedTabId, capturedGen, item);
                 if (added && type == MediaType.VIDEO && item.sizeBytes <= 0) {
@@ -275,34 +289,38 @@ public class MediaBridge {
             item.pageUrl = url;
             item.cookieSourceUrl = "";
             if (type == MediaType.HLS_STREAM) {
-                PARSER_POOL.execute(() -> {
-                    if (capturedGen != MediaRegistry.getTabGeneration(targetTab)) return;
-                    if (!MediaRegistry.canAcceptMedia(targetTab, MediaType.HLS_STREAM)) return;
-                    try {
-                        NetworkSafety.TextFetchResult res = NetworkSafety.fetchTextStrict(
-                                item.url, item.userAgent, item.cookie, item.cookieSourceUrl,
-                                item.pageUrl, item.pageUrl, MAX_PLAYLIST_CHARS, 8000
-                        );
-                        if (res != null && res.body != null && !res.body.isEmpty()) {
-                            String playlistContent = res.body;
-                            if (playlistContent.contains("#EXT-X-KEY:") &&
-                                    (playlistContent.contains("SAMPLE-AES") || playlistContent.contains("KEYFORMAT=\"urn:uuid:"))) {
-                                Log.i(TAG, "Ignoring DRM-protected HLS stream: " + item.url);
-                                return;
+                try {
+                    PARSER_POOL.execute(() -> {
+                        if (capturedGen != MediaRegistry.getTabGeneration(targetTab)) return;
+                        if (!MediaRegistry.canAcceptMedia(targetTab, MediaType.HLS_STREAM)) return;
+                        try {
+                            NetworkSafety.TextFetchResult res = NetworkSafety.fetchTextStrict(
+                                    item.url, item.userAgent, item.cookie, item.cookieSourceUrl,
+                                    item.pageUrl, item.pageUrl, MAX_PLAYLIST_CHARS, 8000
+                            );
+                            if (res != null && res.body != null && !res.body.isEmpty()) {
+                                String playlistContent = res.body;
+                                if (HlsParser.hasUnsupportedEncryption(playlistContent)) {
+                                    Log.i(TAG, "Ignoring DRM/unsupported encrypted HLS stream: " + item.url);
+                                    return;
+                                }
+                                if (HlsParser.isIFramesOnlyPlaylist(playlistContent)) {
+                                    Log.i(TAG, "Ignoring I-frames-only HLS playlist: " + item.url);
+                                    return;
+                                }
+                                List<MediaItem.HlsVariant> variants = HlsParser.parseMasterPlaylist(res.finalUrl, playlistContent);
+                                Collections.sort(variants);
+                                item.variants.addAll(variants);
                             }
-                            if (HlsParser.isIFramesOnlyPlaylist(playlistContent)) {
-                                Log.i(TAG, "Ignoring I-frames-only HLS playlist: " + item.url);
-                                return;
-                            }
-                            List<MediaItem.HlsVariant> variants = HlsParser.parseMasterPlaylist(res.finalUrl, playlistContent);
-                            Collections.sort(variants);
-                            item.variants.addAll(variants);
+                        } catch (Throwable t) {
+                            Log.w(TAG, "Failed parsing HLS master playlist for " + item.url, t);
                         }
-                    } catch (Throwable t) {
-                        Log.w(TAG, "Failed parsing HLS master playlist for " + item.url, t);
-                    }
+                        MediaRegistry.addMediaItem(targetTab, capturedGen, item);
+                    });
+                } catch (java.util.concurrent.RejectedExecutionException ree) {
+                    Log.w(TAG, "HLS parser pool full; registering unparsed item for " + item.url);
                     MediaRegistry.addMediaItem(targetTab, capturedGen, item);
-                });
+                }
             } else {
                 MediaRegistry.addMediaItem(targetTab, capturedGen, item);
             }

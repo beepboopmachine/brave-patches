@@ -11,4 +11,5 @@ public interface Tab {
     boolean isIncognito();
     boolean isClosing();
     Context getContext();
+    Context p();
 }

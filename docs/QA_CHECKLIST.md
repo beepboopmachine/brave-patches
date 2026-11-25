@@ -120,9 +120,9 @@ This document provides a manual verification checklist for validating the patche
 ### Patch 8: Image Bulk-Grabber & WebP-to-PNG/JPG Conversion `[STATUS: IMPLEMENTED IN MAIN]`
 - **Target Card**: Card 3 (Image Bulk-Grabber)
 - **Procedure**:
-  1. Tap Brave Tools -> "Grab Images on Page".
-  2. Inspect the detected image list (tests both `src` and `srcset` attributes).
-  3. Select `hero_1200x800.webp` and tap "Save as PNG".
+  1. Tap the custom toolbar download button and switch to the **Images** tab in the bottom sheet.
+  2. Inspect the detected image list (tests both `src`, lazy-load attributes, and `srcset` attributes).
+  3. Toggle "Convert WebP to PNG", select `hero_1200x800.webp`, and tap "Download Selected" / "Download All".
 - **Pass/Fail Criteria**:
   - [ ] **PASS**: All 4 images `>= 500px` (`hero`, `landscape`, `portrait`, `square`) appear in the selector; `icon_100x100.webp` is filtered out; converted PNG opens cleanly in Android Gallery.
   - [ ] **FAIL**: Small icon appears in list, or WebP conversion fails/corrupts output.
@@ -163,10 +163,10 @@ This document provides a manual verification checklist for validating the patche
 
 ---
 
-### Patch 11: Element Zapper & Ad-Blocker Custom CSS `[STATUS: BLUEPRINTED (RECON_DELTA.md Section 1)]`
+### Patch 11: Element Zapper & Ad-Blocker Custom CSS `[STATUS: BLUEPRINTED (NOT IMPLEMENTED IN MAIN — RECON_DELTA.md Section 1)]`
 - **Target Card**: Card 6 (Element Zapper)
 - **Procedure**:
-  1. Open 3-dot menu -> "Brave Tools" -> "Element Zapper".
+  1. *(Pending implementation of 3-dot "Brave Tools" menu entry)* Open 3-dot menu -> "Brave Tools" -> "Element Zapper".
   2. Tap `#annoying-sticky-banner` at top of page -> Tap "Zap / Block Element".
   3. Tap `#login-nag-overlay` -> Tap "Zap / Block Element".
   4. Refresh the page (`F5` or swipe down).
@@ -246,14 +246,14 @@ This document provides a manual verification checklist for validating the patche
 
 ---
 
-### Patch 15b: Menu & Settings Debloat `[STATUS: BLUEPRINTED (RECON_DELTA.md Section 6)]`
-- **Target Class / Hook**: `AppMenuPropertiesDelegateImpl` & `MainPreferences`
+### Patch 15b: Menu & Settings Debloat `[STATUS: IMPLEMENTED IN MAIN (Debloat Only)]`
+- **Target Class / Hook**: `Lhq2;->f()Lb1b;` / `Lhq2;->U()Lb1b;` & `BraveMainPreferencesBase->V3(Landroid/os/Bundle;)V`
 - **Procedure**:
   1. Tap Brave 3-dot app menu: check for complete absence of Brave Wallet, Brave Leo (AI), Brave News, Brave Rewards, and Brave VPN.
-  2. Verify presence of "Brave Tools" entry in 3-dot menu.
-  3. Open Brave Settings (`chrome://settings`) and verify removal of Wallet/Leo/Rewards/VPN preferences sections.
+  2. Open Brave Settings (`chrome://settings`) and verify removal of Wallet/Leo/Rewards/VPN preferences sections.
+  3. Verify custom media picker opens via the top toolbar download button (separate "Brave Tools" 3-dot menu utilities sheet is blueprinted in `RECON_DELTA.md` but not yet implemented in this branch).
 - **Pass/Fail Criteria**:
-  - [ ] **PASS**: 3-dot menu and Settings are clean and debloated; crypto/AI/ad clutter is completely gone; "Brave Tools" opens the custom mod utilities bottom sheet.
+  - [ ] **PASS**: 3-dot menu and Settings are clean and debloated; crypto/AI/ad clutter is completely gone without blank rows.
   - [ ] **FAIL**: Wallet, Leo, News, Rewards, or VPN entries remain visible or leave empty blank rows in menu/settings.
 
 ---

@@ -115,10 +115,74 @@ public final class NetworkSafety {
                 TimeUnit.SECONDS,
                 new LinkedBlockingQueue<>(queueCapacity),
                 factory,
-                new ThreadPoolExecutor.DiscardPolicy()
+                new ThreadPoolExecutor.AbortPolicy()
         );
         exec.allowCoreThreadTimeOut(true);
         return exec;
+    }
+
+    /**
+     * Validates a MIME type against strict RFC 6838 type/subtype syntax without CR, LF,
+     * or arbitrary parameters to prevent HTTP header injection.
+     */
+    public static String sanitizeMimeType(String rawMime, String fallbackMime) {
+        String safeFallback = (fallbackMime != null && isValidMimeCore(fallbackMime))
+                ? fallbackMime.trim().toLowerCase(Locale.ROOT)
+                : "application/octet-stream";
+        if (rawMime == null) return safeFallback;
+        for (int i = 0; i < rawMime.length(); i++) {
+            char c = rawMime.charAt(i);
+            if (c < 0x20 || c == 0x7F) {
+                return safeFallback;
+            }
+        }
+        String trimmed = rawMime.trim();
+        int semi = trimmed.indexOf(';');
+        String core = (semi >= 0 ? trimmed.substring(0, semi) : trimmed).trim().toLowerCase(Locale.ROOT);
+        if (!isValidMimeCore(core)) {
+            return safeFallback;
+        }
+        return core;
+    }
+
+    private static boolean isValidMimeCore(String core) {
+        if (core == null || core.isEmpty() || core.length() > 127) return false;
+        int slash = core.indexOf('/');
+        if (slash <= 0 || slash >= core.length() - 1) return false;
+        if (core.indexOf('/', slash + 1) >= 0) return false;
+        String type = core.substring(0, slash);
+        String sub = core.substring(slash + 1);
+        return isMimeToken(type) && isMimeToken(sub);
+    }
+
+    private static boolean isMimeToken(String token) {
+        if (token.isEmpty() || token.length() > 63) return false;
+        char first = token.charAt(0);
+        if (!((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') || (first >= '0' && first <= '9'))) {
+            return false;
+        }
+        for (int i = 0; i < token.length(); i++) {
+            char c = token.charAt(i);
+            boolean ok = (c >= 'a' && c <= 'z')
+                    || (c >= 'A' && c <= 'Z')
+                    || (c >= '0' && c <= '9')
+                    || c == '!' || c == '#' || c == '$' || c == '&'
+                    || c == '^' || c == '_' || c == '.' || c == '+' || c == '-';
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    public static String stripControlChars(String value) {
+        if (value == null || value.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder(value.length());
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c >= 0x20 && c != 0x7F) {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
     }
 
     /**
@@ -419,8 +483,16 @@ public final class NetworkSafety {
         }
         if (addr instanceof Inet6Address && raw.length == 16) {
             int b0 = raw[0] & 0xFF;
+            int b1 = raw[1] & 0xFF;
+            int b2 = raw[2] & 0xFF;
+            int b3 = raw[3] & 0xFF;
             // Unique Local Address (fc00::/7)
             if ((b0 & 0xFE) == 0xFC) return true;
+            // Discard-Only Address Block (0100::/64)
+            if (b0 == 0x01 && b1 == 0x00 && b2 == 0x00 && b3 == 0x00
+                    && raw[4] == 0 && raw[5] == 0 && raw[6] == 0 && raw[7] == 0) {
+                return true;
+            }
             // IPv4-mapped IPv6 (::ffff:0:0/96)
             boolean isV4Mapped = true;
             for (int i = 0; i < 10; i++) {
@@ -432,6 +504,27 @@ public final class NetworkSafety {
             if (isV4Mapped && (raw[10] & 0xFF) == 0xFF && (raw[11] & 0xFF) == 0xFF) {
                 byte[] v4 = new byte[]{raw[12], raw[13], raw[14], raw[15]};
                 return isNonPublicIpv4(v4);
+            }
+            // NAT64 local-use prefix (64:ff9b:1::/48, RFC 8215) - non-global local translation space
+            if (b0 == 0x00 && b1 == 0x64 && b2 == 0xFF && b3 == 0x9B
+                    && (raw[4] & 0xFF) == 0x00 && (raw[5] & 0xFF) == 0x01) {
+                return true;
+            }
+            // NAT64 well-known prefix (64:ff9b::/96, RFC 6052) - validate embedded IPv4 in bytes 12..15
+            if (b0 == 0x00 && b1 == 0x64 && b2 == 0xFF && b3 == 0x9B
+                    && raw[4] == 0 && raw[5] == 0 && raw[6] == 0 && raw[7] == 0
+                    && raw[8] == 0 && raw[9] == 0 && raw[10] == 0 && raw[11] == 0) {
+                byte[] v4 = new byte[]{raw[12], raw[13], raw[14], raw[15]};
+                return isNonPublicIpv4(v4);
+            }
+            // 6to4 (2002::/16, RFC 3056) - validate embedded IPv4 in bytes 2..5
+            if (b0 == 0x20 && b1 == 0x02) {
+                byte[] v4 = new byte[]{raw[2], raw[3], raw[4], raw[5]};
+                return isNonPublicIpv4(v4);
+            }
+            // Teredo (2001:0000::/32, RFC 4380) - block Teredo tunneling addresses unconditionally
+            if (b0 == 0x20 && b1 == 0x01 && b2 == 0x00 && b3 == 0x00) {
+                return true;
             }
         }
         return false;
@@ -581,11 +674,19 @@ public final class NetworkSafety {
                     throw new IOException("Too many redirects");
                 }
                 URL next = new URL(logicalUrl, location.trim());
+                String prevOrigin = formatOrigin(logicalUrl.toString());
+                String nextOrigin = formatOrigin(next.toString());
+                boolean sameOriginRedirect = prevOrigin != null && prevOrigin.equals(nextOrigin);
                 currentUrl = next.toString();
                 if ((code == 301 || code == 302 || code == 303) && !"HEAD".equalsIgnoreCase(currentMethod)) {
                     currentMethod = "GET";
                     postBody = null;
                     contentType = null;
+                    originHeader = null;
+                } else if ("POST".equalsIgnoreCase(currentMethod) && !sameOriginRedirect) {
+                    throw new IOException("Blocked cross-origin POST redirect from " + prevOrigin + " to " + nextOrigin);
+                } else if (!sameOriginRedirect) {
+                    originHeader = null;
                 }
                 continue;
             }

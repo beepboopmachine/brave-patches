@@ -31,11 +31,28 @@ public final class MediaRegistry {
         void onMediaCountChanged(int tabId, int mediaCount, int imageCount);
     }
 
-    private static final Map<Integer, Object> TAB_LOCKS = new ConcurrentHashMap<>();
-    private static final Map<Integer, Set<MediaItem>> TAB_MEDIA = new ConcurrentHashMap<>();
-    private static final Map<Integer, Set<MediaItem>> TAB_IMAGES = new ConcurrentHashMap<>();
-    private static final Map<Integer, AtomicLong> TAB_GENERATIONS = new ConcurrentHashMap<>();
-    private static final Map<Integer, String> TAB_LAST_URL = new ConcurrentHashMap<>();
+    private static final int LOCK_STRIPE_COUNT = 64;
+    private static final Object[] LOCK_STRIPES = new Object[LOCK_STRIPE_COUNT];
+    static {
+        for (int i = 0; i < LOCK_STRIPE_COUNT; i++) {
+            LOCK_STRIPES[i] = new Object();
+        }
+    }
+
+    private static final class TabState {
+        long generation;
+        String lastUrl = "";
+        final Set<MediaItem> media = new CopyOnWriteArraySet<>();
+        final Set<MediaItem> images = new CopyOnWriteArraySet<>();
+
+        TabState(long generation) {
+            this.generation = generation;
+        }
+    }
+
+    // Strictly monotonic process-wide generation seed so removed/reused tabIds never collide
+    private static final AtomicLong GLOBAL_GENERATION = new AtomicLong(1L);
+    private static final Map<Integer, TabState> TAB_STATES = new ConcurrentHashMap<>();
     private static final CopyOnWriteArrayList<MediaCountListener> LISTENERS = new CopyOnWriteArrayList<>();
     private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
 
@@ -69,7 +86,16 @@ public final class MediaRegistry {
     private MediaRegistry() {}
 
     private static Object getTabLock(int tabId) {
-        return TAB_LOCKS.computeIfAbsent(tabId, k -> new Object());
+        return LOCK_STRIPES[(tabId & 0x7FFFFFFF) % LOCK_STRIPE_COUNT];
+    }
+
+    private static TabState getOrCreateTabStateLocked(int tabId) {
+        TabState st = TAB_STATES.get(tabId);
+        if (st == null) {
+            st = new TabState(GLOBAL_GENERATION.incrementAndGet());
+            TAB_STATES.put(tabId, st);
+        }
+        return st;
     }
 
     public static void addListener(MediaCountListener listener) {
@@ -86,8 +112,9 @@ public final class MediaRegistry {
 
     public static long getTabGeneration(int tabId) {
         if (tabId < 0) tabId = 0;
-        AtomicLong gen = TAB_GENERATIONS.computeIfAbsent(tabId, k -> new AtomicLong(1));
-        return gen.get();
+        synchronized (getTabLock(tabId)) {
+            return getOrCreateTabStateLocked(tabId).generation;
+        }
     }
 
     /**
@@ -96,10 +123,12 @@ public final class MediaRegistry {
      */
     public static boolean canAcceptMedia(int tabId, MediaType type) {
         if (tabId < 0) tabId = 0;
+        TabState st = TAB_STATES.get(tabId);
+        if (st == null) return true;
         boolean isImage = (type != null && type.isImage());
         int maxCap = isImage ? MAX_IMAGES_PER_TAB : MAX_MEDIA_PER_TAB;
-        Set<MediaItem> set = isImage ? TAB_IMAGES.get(tabId) : TAB_MEDIA.get(tabId);
-        return set == null || set.size() < maxCap;
+        Set<MediaItem> set = isImage ? st.images : st.media;
+        return set.size() < maxCap;
     }
 
     /**
@@ -112,19 +141,15 @@ public final class MediaRegistry {
         String normalizedNew = normalizePageUrl(newUrl);
 
         synchronized (getTabLock(tabId)) {
-            String prev = TAB_LAST_URL.get(tabId);
-            if (!force && !normalizedNew.isEmpty() && normalizedNew.equals(prev)) {
-                return getTabGeneration(tabId);
+            TabState st = getOrCreateTabStateLocked(tabId);
+            if (!force && !normalizedNew.isEmpty() && normalizedNew.equals(st.lastUrl)) {
+                return st.generation;
             }
-            AtomicLong gen = TAB_GENERATIONS.computeIfAbsent(tabId, k -> new AtomicLong(1));
-            nextGen = gen.incrementAndGet();
-            if (!normalizedNew.isEmpty()) {
-                TAB_LAST_URL.put(tabId, normalizedNew);
-            } else {
-                TAB_LAST_URL.remove(tabId);
-            }
-            TAB_MEDIA.remove(tabId);
-            TAB_IMAGES.remove(tabId);
+            nextGen = GLOBAL_GENERATION.incrementAndGet();
+            st.generation = nextGen;
+            st.lastUrl = normalizedNew;
+            st.media.clear();
+            st.images.clear();
         }
 
         notifyCountChanged(tabId);
@@ -141,114 +166,115 @@ public final class MediaRegistry {
     }
 
     public static boolean addMediaItem(int tabId, MediaItem item) {
-        return addMediaItem(tabId, getTabGeneration(tabId), item);
+        return addMediaItem(tabId, 0L, item);
     }
 
     /**
-     * Atomically validates navigation generation, merges duplicates (including auth/variants),
-     * enforces per-tab capacity, and inserts the item.
+     * Atomically validates navigation generation, merges duplicates (including type upgrades,
+     * auth/variants), enforces per-tab capacity, and inserts the item.
      *
-     * @return true if a new item was inserted, false if stale, duplicate-merged, or rejected at cap.
+     * @return true if a new item was inserted or upgraded, false if stale, duplicate-merged, or rejected at cap.
      */
     public static boolean addMediaItem(int tabId, long expectedGeneration, MediaItem item) {
         if (tabId < 0) tabId = 0;
         if (item == null || item.url == null || item.url.isEmpty()) return false;
 
-        boolean inserted = false;
+        boolean changed = false;
         synchronized (getTabLock(tabId)) {
-            long currentGen = getTabGeneration(tabId);
-            if (expectedGeneration > 0 && expectedGeneration != currentGen) {
-                Log.d(TAG, "Dropping stale media item from previous page (gen " + expectedGeneration + " != " + currentGen + "): " + item.url);
-                return false;
+            TabState st;
+            if (expectedGeneration > 0) {
+                st = TAB_STATES.get(tabId);
+                if (st == null || st.generation != expectedGeneration) {
+                    long actualGen = (st != null) ? st.generation : -1L;
+                    Log.d(TAG, "Dropping stale media item from previous page (gen " + expectedGeneration + " != " + actualGen + "): " + item.url);
+                    return false;
+                }
+            } else {
+                st = getOrCreateTabStateLocked(tabId);
             }
 
-            Map<Integer, Set<MediaItem>> targetMap = item.type.isImage() ? TAB_IMAGES : TAB_MEDIA;
-            int maxCap = item.type.isImage() ? MAX_IMAGES_PER_TAB : MAX_MEDIA_PER_TAB;
-
-            Set<MediaItem> set = targetMap.computeIfAbsent(tabId, k -> new CopyOnWriteArraySet<>());
+            boolean isImage = item.type.isImage();
+            Set<MediaItem> set = isImage ? st.images : st.media;
+            int maxCap = isImage ? MAX_IMAGES_PER_TAB : MAX_MEDIA_PER_TAB;
 
             for (MediaItem existing : set) {
                 if (existing.equals(item)) {
-                    existing.mergeFrom(item);
+                    boolean upgraded = existing.mergeFrom(item);
+                    if (upgraded) {
+                        changed = true;
+                        break;
+                    }
                     return false;
                 }
             }
 
-            if (set.size() >= maxCap) {
-                return false;
+            if (!changed) {
+                if (set.size() >= maxCap) {
+                    return false;
+                }
+                Log.i(TAG, "addMediaItem: tab=" + tabId + " (gen=" + st.generation + "), " + item.type + " -> " + item.url);
+                set.add(item);
+                changed = true;
             }
-
-            Log.i(TAG, "addMediaItem: tab=" + tabId + " (gen=" + currentGen + "), " + item.type + " -> " + item.url);
-            set.add(item);
-            inserted = true;
         }
 
-        if (inserted) {
+        if (changed) {
             notifyCountChanged(tabId);
         }
-        return inserted;
+        return changed;
     }
 
     public static List<MediaItem> getMediaForTab(int tabId) {
         if (tabId < 0) return Collections.emptyList();
-        Set<MediaItem> items = TAB_MEDIA.get(tabId);
-        return items != null ? new ArrayList<>(items) : Collections.emptyList();
+        TabState st = TAB_STATES.get(tabId);
+        return st != null ? new ArrayList<>(st.media) : Collections.emptyList();
     }
 
     public static List<MediaItem> getImagesForTab(int tabId) {
         if (tabId < 0) return Collections.emptyList();
-        Set<MediaItem> items = TAB_IMAGES.get(tabId);
-        return items != null ? new ArrayList<>(items) : Collections.emptyList();
+        TabState st = TAB_STATES.get(tabId);
+        return st != null ? new ArrayList<>(st.images) : Collections.emptyList();
     }
 
     public static int getMediaCount(int tabId) {
         if (tabId < 0) return 0;
-        Set<MediaItem> items = TAB_MEDIA.get(tabId);
-        return items != null ? items.size() : 0;
+        TabState st = TAB_STATES.get(tabId);
+        return st != null ? st.media.size() : 0;
     }
 
     public static int getImageCount(int tabId) {
         if (tabId < 0) return 0;
-        Set<MediaItem> items = TAB_IMAGES.get(tabId);
-        return items != null ? items.size() : 0;
+        TabState st = TAB_STATES.get(tabId);
+        return st != null ? st.images.size() : 0;
     }
 
     public static void clearTab(int tabId) {
         if (tabId < 0) tabId = 0;
         synchronized (getTabLock(tabId)) {
-            AtomicLong gen = TAB_GENERATIONS.computeIfAbsent(tabId, k -> new AtomicLong(1));
-            gen.incrementAndGet();
-            TAB_LAST_URL.remove(tabId);
-            TAB_MEDIA.remove(tabId);
-            TAB_IMAGES.remove(tabId);
+            TabState st = getOrCreateTabStateLocked(tabId);
+            st.generation = GLOBAL_GENERATION.incrementAndGet();
+            st.lastUrl = "";
+            st.media.clear();
+            st.images.clear();
         }
         notifyCountChanged(tabId);
     }
 
     /**
-     * Permanently removes all per-tab registry state (including generation counter and lock)
-     * when a tab is destroyed.
+     * Removes per-tab media state when a tab is destroyed while advancing the monotonic
+     * generation seed so stale async tasks or reused tab IDs can never collide.
      */
     public static void removeTab(int tabId) {
         if (tabId < 0) return;
-        Object lock = TAB_LOCKS.get(tabId);
-        if (lock != null) {
-            synchronized (lock) {
-                AtomicLong gen = TAB_GENERATIONS.get(tabId);
-                if (gen != null) {
-                    gen.incrementAndGet();
-                }
-                TAB_LAST_URL.remove(tabId);
-                TAB_MEDIA.remove(tabId);
-                TAB_IMAGES.remove(tabId);
-                TAB_GENERATIONS.remove(tabId);
-                TAB_LOCKS.remove(tabId, lock);
+        synchronized (getTabLock(tabId)) {
+            GLOBAL_GENERATION.incrementAndGet();
+            TabState removed = TAB_STATES.remove(tabId);
+            if (removed != null) {
+                removed.generation = GLOBAL_GENERATION.get();
+                removed.lastUrl = "";
+                removed.media.clear();
+                removed.images.clear();
             }
-        } else {
-            TAB_LAST_URL.remove(tabId);
-            TAB_MEDIA.remove(tabId);
-            TAB_IMAGES.remove(tabId);
-            TAB_GENERATIONS.remove(tabId);
         }
         notifyCountChanged(tabId);
     }

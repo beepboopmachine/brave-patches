@@ -3,6 +3,8 @@ package dev.brave.extension.media;
 import android.net.Uri;
 import android.util.Log;
 import java.util.Collections;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -16,7 +18,8 @@ import org.json.JSONObject;
 /**
  * Universal, domain-agnostic background resolver for video streams, embedded players,
  * and cross-origin iframes. Enforces SSRF protection, bounded pools, bounded recursion,
- * retryable failure state tracking, radix-aware P.A.C.K.E.R unpacking, and port-preserving API URLs.
+ * bounded per-tab LRU/TTL state storage, retryable failure state tracking, radix-aware
+ * P.A.C.K.E.R unpacking, and port-preserving API URLs.
  */
 public final class IframeStreamResolver {
     private static final String TAG = "Brave_IframeResolver";
@@ -26,6 +29,8 @@ public final class IframeStreamResolver {
     private static final int MAX_NESTED_TOTAL = 10;
     private static final long FAILED_RETRY_COOLDOWN_MS = 15_000L;
     private static final int MAX_FAILED_RETRIES = 2;
+    private static final int MAX_PER_TAB_COMPLETED_STATES = 64;
+    private static final long COMPLETED_STATE_TTL_MS = 10 * 60 * 1000L;
 
     private static final ExecutorService RESOLVER_POOL = NetworkSafety.newBoundedPool(4, 48, "BraveIframeResolver");
 
@@ -43,7 +48,10 @@ public final class IframeStreamResolver {
         }
     }
 
-    private static final Map<String, ResolveEntry> RESOLVE_STATES = new ConcurrentHashMap<>();
+    // Active in-flight resolutions are stored separately so LRU eviction never drops an active task.
+    private static final Map<String, ResolveEntry> PENDING_RESOLUTIONS = new ConcurrentHashMap<>();
+    // Per-tab bounded LRU+TTL cache of completed/failed URL states.
+    private static final ConcurrentHashMap<Integer, Map<String, ResolveEntry>> COMPLETED_STATES = new ConcurrentHashMap<>();
 
     // Direct stream extensions: m3u8, mpd, mp4, webm, m4v, mov, mkv, avi, flv, 3gp, ogv, gifv
     private static final Pattern DIRECT_STREAM_PATTERN = Pattern.compile(
@@ -73,7 +81,46 @@ public final class IframeStreamResolver {
 
     public static void clearTab(int tabId) {
         String prefix = tabId + ":";
-        RESOLVE_STATES.keySet().removeIf(key -> key.startsWith(prefix));
+        PENDING_RESOLUTIONS.keySet().removeIf(key -> key.startsWith(prefix));
+        COMPLETED_STATES.remove(tabId);
+    }
+
+    private static Map<String, ResolveEntry> getOrCreateCompletedMap(int tabId) {
+        return COMPLETED_STATES.computeIfAbsent(tabId, k -> new LinkedHashMap<String, ResolveEntry>(32, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<String, ResolveEntry> eldest) {
+                return size() > MAX_PER_TAB_COMPLETED_STATES;
+            }
+        });
+    }
+
+    private static ResolveEntry getCompletedEntry(int tabId, String key, long now) {
+        Map<String, ResolveEntry> map = COMPLETED_STATES.get(tabId);
+        if (map == null) return null;
+        synchronized (map) {
+            ResolveEntry entry = map.get(key);
+            if (entry != null && (now - entry.timestamp) > COMPLETED_STATE_TTL_MS) {
+                map.remove(key);
+                return null;
+            }
+            return entry;
+        }
+    }
+
+    private static void putCompletedEntry(int tabId, String key, ResolveEntry entry, long now) {
+        Map<String, ResolveEntry> map = getOrCreateCompletedMap(tabId);
+        synchronized (map) {
+            Iterator<Map.Entry<String, ResolveEntry>> it = map.entrySet().iterator();
+            while (it.hasNext()) {
+                Map.Entry<String, ResolveEntry> e = it.next();
+                if ((now - e.getValue().timestamp) > COMPLETED_STATE_TTL_MS) {
+                    it.remove();
+                } else {
+                    break; // Access-ordered LRU; oldest timestamps appear first when inactive
+                }
+            }
+            map.put(key, entry);
+        }
     }
 
     public static void resolveIframeAsync(final String targetUrl, final String pageContextUrl, final int tabId) {
@@ -85,43 +132,56 @@ public final class IframeStreamResolver {
         final String key = targetTab + ":" + gen + ":" + targetUrl;
         final long now = System.currentTimeMillis();
 
-        ResolveEntry prev = RESOLVE_STATES.get(key);
+        final ResolveEntry pendingEntry = new ResolveEntry(Status.PENDING, now, 0);
+        if (PENDING_RESOLUTIONS.putIfAbsent(key, pendingEntry) != null) {
+            return;
+        }
+
+        ResolveEntry prev = getCompletedEntry(targetTab, key, now);
         if (prev != null) {
-            if (prev.status == Status.PENDING || prev.status == Status.RESOLVED) {
+            if (prev.status == Status.RESOLVED) {
+                PENDING_RESOLUTIONS.remove(key, pendingEntry);
                 return;
             }
             if (prev.status == Status.FAILED) {
                 if (prev.failures >= MAX_FAILED_RETRIES || (now - prev.timestamp) < FAILED_RETRY_COOLDOWN_MS) {
+                    PENDING_RESOLUTIONS.remove(key, pendingEntry);
                     return;
                 }
             }
         }
 
         final int priorFailures = (prev != null) ? prev.failures : 0;
-        RESOLVE_STATES.put(key, new ResolveEntry(Status.PENDING, now, priorFailures));
 
-        RESOLVER_POOL.execute(() -> {
-            if (gen != MediaRegistry.getTabGeneration(targetTab)) {
-                RESOLVE_STATES.remove(key);
-                return;
-            }
-            boolean succeeded = false;
-            try {
-                Log.i(TAG, "Resolving target for tab " + targetTab + " (gen=" + gen + "): " + targetUrl);
-                AtomicInteger nestedBudget = new AtomicInteger(MAX_NESTED_TOTAL);
-                succeeded = resolveInternal(targetUrl, pageContextUrl, pageContextUrl, targetTab, gen, 0, nestedBudget);
-            } catch (Throwable t) {
-                Log.w(TAG, "Error resolving: " + targetUrl, t);
-            } finally {
+        try {
+            RESOLVER_POOL.execute(() -> {
                 if (gen != MediaRegistry.getTabGeneration(targetTab)) {
-                    RESOLVE_STATES.remove(key);
-                } else if (succeeded) {
-                    RESOLVE_STATES.put(key, new ResolveEntry(Status.RESOLVED, System.currentTimeMillis(), priorFailures));
-                } else {
-                    RESOLVE_STATES.put(key, new ResolveEntry(Status.FAILED, System.currentTimeMillis(), priorFailures + 1));
+                    PENDING_RESOLUTIONS.remove(key, pendingEntry);
+                    return;
                 }
-            }
-        });
+                boolean succeeded = false;
+                try {
+                    Log.i(TAG, "Resolving target for tab " + targetTab + " (gen=" + gen + "): " + targetUrl);
+                    AtomicInteger nestedBudget = new AtomicInteger(MAX_NESTED_TOTAL);
+                    succeeded = resolveInternal(targetUrl, pageContextUrl, pageContextUrl, targetTab, gen, 0, nestedBudget);
+                } catch (Throwable t) {
+                    Log.w(TAG, "Error resolving: " + targetUrl, t);
+                } finally {
+                    PENDING_RESOLUTIONS.remove(key, pendingEntry);
+                    long finishedAt = System.currentTimeMillis();
+                    if (gen == MediaRegistry.getTabGeneration(targetTab)) {
+                        if (succeeded) {
+                            putCompletedEntry(targetTab, key, new ResolveEntry(Status.RESOLVED, finishedAt, priorFailures), finishedAt);
+                        } else {
+                            putCompletedEntry(targetTab, key, new ResolveEntry(Status.FAILED, finishedAt, priorFailures + 1), finishedAt);
+                        }
+                    }
+                }
+            });
+        } catch (java.util.concurrent.RejectedExecutionException ree) {
+            PENDING_RESOLUTIONS.remove(key, pendingEntry);
+            Log.w(TAG, "Resolver pool queue full; rolled back pending state for " + targetUrl);
+        }
     }
 
     private static boolean resolveInternal(
@@ -143,6 +203,7 @@ public final class IframeStreamResolver {
         String effectiveUrl = fetched.finalUrl;
         String html = fetched.body;
         String pageTitle = extractPageTitle(html, effectiveUrl);
+        boolean foundMedia = false;
 
         String defaultPoster = "";
         try {
@@ -168,7 +229,9 @@ public final class IframeStreamResolver {
                     String res = extractTagAttribute(sTag, "res");
                     if (res.isEmpty()) res = extractTagAttribute(sTag, "label");
                     if (isValidStreamUrl(src)) {
-                        registerFoundStream(src, effectiveUrl, pageContextUrl, tabId, gen, pageTitle, poster, res);
+                        if (registerFoundStream(src, effectiveUrl, pageContextUrl, tabId, gen, pageTitle, poster, res)) {
+                            foundMedia = true;
+                        }
                         resolvedInTag.add(src);
                     }
                 }
@@ -180,7 +243,9 @@ public final class IframeStreamResolver {
         while (streamMatcher.find()) {
             String candidate = streamMatcher.group(0);
             if (!resolvedInTag.contains(candidate) && isValidStreamUrl(candidate)) {
-                registerFoundStream(candidate, effectiveUrl, pageContextUrl, tabId, gen, pageTitle, defaultPoster, "");
+                if (registerFoundStream(candidate, effectiveUrl, pageContextUrl, tabId, gen, pageTitle, defaultPoster, "")) {
+                    foundMedia = true;
+                }
             }
         }
 
@@ -189,7 +254,9 @@ public final class IframeStreamResolver {
         while (configMatcher.find()) {
             String candidate = configMatcher.group(1);
             if (!resolvedInTag.contains(candidate) && isValidStreamUrl(candidate)) {
-                registerFoundStream(candidate, effectiveUrl, pageContextUrl, tabId, gen, pageTitle, defaultPoster, "");
+                if (registerFoundStream(candidate, effectiveUrl, pageContextUrl, tabId, gen, pageTitle, defaultPoster, "")) {
+                    foundMedia = true;
+                }
             }
         }
 
@@ -207,14 +274,18 @@ public final class IframeStreamResolver {
                     if (unpackedMatcher.find()) {
                         String stream = unpackedMatcher.group(0);
                         if (isValidStreamUrl(stream)) {
-                            registerFoundStream(stream, effectiveUrl, pageContextUrl, tabId, gen, pageTitle, defaultPoster, "");
+                            if (registerFoundStream(stream, effectiveUrl, pageContextUrl, tabId, gen, pageTitle, defaultPoster, "")) {
+                                foundMedia = true;
+                            }
                         }
                     }
                     Matcher unpackedConfig = CONFIG_URL_PATTERN.matcher(unpacked);
                     if (unpackedConfig.find()) {
                         String stream = unpackedConfig.group(1);
                         if (isValidStreamUrl(stream)) {
-                            registerFoundStream(stream, effectiveUrl, pageContextUrl, tabId, gen, pageTitle, defaultPoster, "");
+                            if (registerFoundStream(stream, effectiveUrl, pageContextUrl, tabId, gen, pageTitle, defaultPoster, "")) {
+                                foundMedia = true;
+                            }
                         }
                     }
                 }
@@ -227,7 +298,9 @@ public final class IframeStreamResolver {
         Matcher apiMatcher = API_ENDPOINT_PATTERN.matcher(html);
         if (apiMatcher.find()) {
             String endpoint = apiMatcher.group(1);
-            tryResolveGenericApi(effectiveUrl, endpoint, html, tabId, gen, pageTitle, pageContextUrl);
+            if (tryResolveGenericApi(effectiveUrl, endpoint, html, tabId, gen, pageTitle, pageContextUrl)) {
+                foundMedia = true;
+            }
         }
 
         // 6. Content Images in HTML (e.g. albums, gallery pages)
@@ -238,7 +311,7 @@ public final class IframeStreamResolver {
                 int imgCount = 0;
                 final int targetTab = tabId >= 0 ? tabId : 0;
                 while (imgMatcher.find() && imgCount < 100) {
-                    if (gen != MediaRegistry.getTabGeneration(targetTab)) return true;
+                    if (gen != MediaRegistry.getTabGeneration(targetTab)) return false;
                     String imgUrl = imgMatcher.group(1);
                     String lower = imgUrl.toLowerCase(Locale.ROOT);
                     if (!lower.contains("avatar") && !lower.contains("logo") && !lower.contains("icon") && !lower.contains("analytics") && !lower.contains("tracker") && !lower.contains("doubleclick")) {
@@ -258,7 +331,9 @@ public final class IframeStreamResolver {
                             );
                             imgItem.pageUrl = effectiveUrl;
                             imgItem.cookieSourceUrl = "";
-                            MediaRegistry.addMediaItem(targetTab, gen, imgItem);
+                            if (MediaRegistry.addMediaItem(targetTab, gen, imgItem)) {
+                                foundMedia = true;
+                            }
                         }
                     }
                 }
@@ -270,17 +345,19 @@ public final class IframeStreamResolver {
         Matcher nestedMatcher = nestedIframePattern.matcher(html);
         int levelCount = 0;
         while (nestedMatcher.find() && levelCount < MAX_NESTED_PER_LEVEL) {
-            if (gen != MediaRegistry.getTabGeneration(tabId)) return true;
+            if (gen != MediaRegistry.getTabGeneration(tabId)) return false;
             if (nestedBudget.getAndDecrement() <= 0) break;
             String nestedUrl = nestedMatcher.group(1);
             String lower = nestedUrl.toLowerCase(Locale.ROOT);
             if (!lower.contains("google") && !lower.contains("doubleclick") && !lower.contains("facebook")) {
                 levelCount++;
                 Log.i(TAG, "Found nested iframe: " + nestedUrl);
-                resolveInternal(nestedUrl, effectiveUrl, pageContextUrl, tabId, gen, depth + 1, nestedBudget);
+                if (resolveInternal(nestedUrl, effectiveUrl, pageContextUrl, tabId, gen, depth + 1, nestedBudget)) {
+                    foundMedia = true;
+                }
             }
         }
-        return true;
+        return !fetched.truncated && foundMedia;
     }
 
     private static boolean isValidStreamUrl(String url) {
@@ -348,11 +425,11 @@ public final class IframeStreamResolver {
         }
     }
 
-    private static void tryResolveGenericApi(String pageUrl, String endpoint, String html, int tabId, long gen, String pageTitle, String pageContextUrl) {
-        if (gen != MediaRegistry.getTabGeneration(tabId)) return;
+    private static boolean tryResolveGenericApi(String pageUrl, String endpoint, String html, int tabId, long gen, String pageTitle, String pageContextUrl) {
+        if (gen != MediaRegistry.getTabGeneration(tabId)) return false;
         try {
             String origin = NetworkSafety.formatOrigin(pageUrl);
-            if (origin == null) return;
+            if (origin == null) return false;
 
             String fullApiUrl = endpoint.startsWith("http://") || endpoint.startsWith("https://")
                     ? endpoint
@@ -378,7 +455,7 @@ public final class IframeStreamResolver {
                 }
             }
 
-            if (filecode.isEmpty()) return;
+            if (filecode.isEmpty()) return false;
 
             JSONObject body = new JSONObject();
             body.put("filecode", filecode);
@@ -394,8 +471,7 @@ public final class IframeStreamResolver {
             if (apiResp != null && !apiResp.isEmpty()) {
                 Matcher m = DIRECT_STREAM_PATTERN.matcher(apiResp);
                 if (m.find()) {
-                    registerFoundStream(m.group(0), pageUrl, pageContextUrl, tabId, gen, pageTitle, "", "");
-                    return;
+                    return registerFoundStream(m.group(0), pageUrl, pageContextUrl, tabId, gen, pageTitle, "", "");
                 }
                 try {
                     JSONObject json = new JSONObject(apiResp);
@@ -407,13 +483,14 @@ public final class IframeStreamResolver {
                         String thumb = json.optString("thumbnail", "");
                         if (thumb.isEmpty()) thumb = json.optString("poster", "");
                         String title = json.optString("title", pageTitle);
-                        registerFoundStream(stream, pageUrl, pageContextUrl, tabId, gen, title, thumb, "");
+                        return registerFoundStream(stream, pageUrl, pageContextUrl, tabId, gen, title, thumb, "");
                     }
                 } catch (Throwable ignored) {}
             }
         } catch (Throwable t) {
             Log.d(TAG, "tryResolveGenericApi error", t);
         }
+        return false;
     }
 
     private static String extractTagAttribute(String tag, String attrName) {
@@ -432,10 +509,10 @@ public final class IframeStreamResolver {
         return 0;
     }
 
-    private static void registerFoundStream(String streamUrl, String sourceUrl, String pageContextUrl, int tabId, long gen, String title, String thumb, String quality) {
-        if (streamUrl == null || streamUrl.isEmpty()) return;
+    private static boolean registerFoundStream(String streamUrl, String sourceUrl, String pageContextUrl, int tabId, long gen, String title, String thumb, String quality) {
+        if (streamUrl == null || streamUrl.isEmpty()) return false;
         final int targetTab = tabId >= 0 ? tabId : 0;
-        if (gen != MediaRegistry.getTabGeneration(targetTab)) return;
+        if (gen != MediaRegistry.getTabGeneration(targetTab)) return false;
 
         MediaType type = MediaType.VIDEO;
         String lower = streamUrl.toLowerCase(Locale.ROOT);
@@ -445,10 +522,10 @@ public final class IframeStreamResolver {
             type = MediaType.DASH_STREAM;
         }
 
-        if (!MediaRegistry.canAcceptMedia(targetTab, type)) return;
+        if (!MediaRegistry.canAcceptMedia(targetTab, type)) return false;
 
         final String effectivePage = (sourceUrl != null && !sourceUrl.isEmpty()) ? sourceUrl : pageContextUrl;
-        if (!NetworkSafety.isAllowedTargetUrl(streamUrl, pageContextUrl)) return;
+        if (!NetworkSafety.isAllowedTargetUrl(streamUrl, pageContextUrl)) return false;
 
         Log.i(TAG, "UNIVERSALLY RESOLVED STREAM: tab=" + targetTab + " (gen=" + gen + "), " + streamUrl + " (quality=" + quality + ", thumb=" + thumb + ")");
 
@@ -467,17 +544,16 @@ public final class IframeStreamResolver {
                         streamUrl, NetworkSafety.DEFAULT_USER_AGENT, "", "",
                         effectivePage, pageContextUrl, MAX_PLAYLIST_CHARS, 8000
                 );
-                if (gen != MediaRegistry.getTabGeneration(targetTab)) return;
+                if (gen != MediaRegistry.getTabGeneration(targetTab)) return false;
                 if (plRes != null && plRes.body != null && !plRes.body.isEmpty()) {
                     String playlist = plRes.body;
-                    if (playlist.contains("#EXT-X-KEY:") &&
-                            (playlist.contains("SAMPLE-AES") || playlist.contains("KEYFORMAT=\"urn:uuid:"))) {
-                        Log.i(TAG, "Ignoring DRM-protected HLS stream: " + streamUrl);
-                        return;
+                    if (HlsParser.hasUnsupportedEncryption(playlist)) {
+                        Log.i(TAG, "Ignoring DRM/unsupported encrypted HLS stream: " + streamUrl);
+                        return false;
                     }
                     if (HlsParser.isIFramesOnlyPlaylist(playlist)) {
                         Log.i(TAG, "Ignoring I-frames-only HLS playlist: " + streamUrl);
-                        return;
+                        return false;
                     }
                     List<MediaItem.HlsVariant> variants = HlsParser.parseMasterPlaylist(plRes.finalUrl, playlist);
                     Collections.sort(variants);
@@ -490,11 +566,13 @@ public final class IframeStreamResolver {
         if (added && type == MediaType.VIDEO && item.sizeBytes <= 0) {
             probeContentLengthAsync(item);
         }
+        return true;
     }
 
     public static void probeContentLengthAsync(final MediaItem item) {
         if (item == null || item.sizeBytes > 0 || item.url == null || item.type != MediaType.VIDEO) return;
-        RESOLVER_POOL.execute(() -> {
+        try {
+            RESOLVER_POOL.execute(() -> {
             NetworkSafety.SafeConnection sc = null;
             try {
                 String refPage = (item.pageUrl != null && !item.pageUrl.isEmpty()) ? item.pageUrl : item.referer;
@@ -513,7 +591,8 @@ public final class IframeStreamResolver {
             } finally {
                 if (sc != null && sc.conn != null) sc.conn.disconnect();
             }
-        });
+            });
+        } catch (java.util.concurrent.RejectedExecutionException ignored) {}
     }
 
     private static String extractPageTitle(String html, String fallbackUrl) {

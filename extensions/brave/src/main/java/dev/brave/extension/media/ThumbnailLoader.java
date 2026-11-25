@@ -19,9 +19,13 @@ public final class ThumbnailLoader {
     private static final int MAX_THUMB_BYTES = 2 * 1024 * 1024; // 2 MB download cap
     private static final int MAX_DECODE_DIM = 512;
     private static final long MAX_DECODE_PIXELS = 256L * 256L * 2L; // ~512 KB ARGB_8888 max
+    private static final int MAX_CONVERT_RAW_DIM = 16384;
+    private static final long MAX_CONVERT_RAW_PIXELS = 64_000_000L;
+    private static final int MAX_CONVERT_OUT_DIM = 4096;
+    private static final long MAX_CONVERT_OUT_PIXELS = 16_000_000L; // ~64 MB max ARGB_8888
 
     private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
-    private static final ExecutorService THREAD_POOL = NetworkSafety.newBoundedPool(3, 32, "BraveThumbLoader");
+    private static final ExecutorService THREAD_POOL = NetworkSafety.newBoundedPool(3, 512, "BraveThumbLoader");
 
     private static final LruCache<String, Bitmap> CACHE;
 
@@ -58,43 +62,81 @@ public final class ThumbnailLoader {
         imageView.setImageDrawable(null);
         imageView.setVisibility(View.VISIBLE);
 
-        THREAD_POOL.execute(() -> {
-            NetworkSafety.SafeConnection sc = null;
-            try {
-                sc = NetworkSafety.openSafeConnection(
-                        cleanUrl, "GET", NetworkSafety.DEFAULT_USER_AGENT, "", "",
-                        referer, referer, null, false, 6000, 6000
-                );
-                if (sc.responseCode >= 200 && sc.responseCode < 300) {
-                    byte[] data = NetworkSafety.readBytesBounded(sc.conn.getInputStream(), MAX_THUMB_BYTES);
-                    if (data.length > 0) {
-                        BitmapFactory.Options opts = new BitmapFactory.Options();
-                        opts.inJustDecodeBounds = true;
-                        BitmapFactory.decodeByteArray(data, 0, data.length, opts);
+        try {
+            THREAD_POOL.execute(() -> {
+                if (!cleanUrl.equals(imageView.getTag())) return;
+                NetworkSafety.SafeConnection sc = null;
+                try {
+                    sc = NetworkSafety.openSafeConnection(
+                            cleanUrl, "GET", NetworkSafety.DEFAULT_USER_AGENT, "", "",
+                            referer, referer, null, false, 6000, 6000
+                    );
+                    if (sc.responseCode >= 200 && sc.responseCode < 300) {
+                        byte[] data = NetworkSafety.readBytesBounded(sc.conn.getInputStream(), MAX_THUMB_BYTES);
+                        if (data.length > 0) {
+                            BitmapFactory.Options opts = new BitmapFactory.Options();
+                            opts.inJustDecodeBounds = true;
+                            BitmapFactory.decodeByteArray(data, 0, data.length, opts);
 
-                        if (opts.outWidth <= 0 || opts.outHeight <= 0) return;
+                            if (opts.outWidth <= 0 || opts.outHeight <= 0) return;
 
-                        opts.inSampleSize = calculateInSampleSize(opts, 240, 160);
-                        opts.inJustDecodeBounds = false;
-                        Bitmap bmp = BitmapFactory.decodeByteArray(data, 0, data.length, opts);
+                            opts.inSampleSize = calculateInSampleSize(opts, 240, 160);
+                            opts.inJustDecodeBounds = false;
+                            Bitmap bmp = BitmapFactory.decodeByteArray(data, 0, data.length, opts);
 
-                        if (bmp != null) {
-                            CACHE.put(cleanUrl, bmp);
-                            MAIN_HANDLER.post(() -> {
-                                if (cleanUrl.equals(imageView.getTag())) {
-                                    imageView.setImageBitmap(bmp);
-                                    imageView.setVisibility(View.VISIBLE);
-                                }
-                            });
+                            if (bmp != null) {
+                                CACHE.put(cleanUrl, bmp);
+                                MAIN_HANDLER.post(() -> {
+                                    if (cleanUrl.equals(imageView.getTag())) {
+                                        imageView.setImageBitmap(bmp);
+                                        imageView.setVisibility(View.VISIBLE);
+                                    }
+                                });
+                            }
                         }
                     }
+                } catch (Throwable t) {
+                    Log.d(TAG, "Failed loading thumb: " + cleanUrl, t);
+                } finally {
+                    if (sc != null && sc.conn != null) sc.conn.disconnect();
                 }
-            } catch (Throwable t) {
-                Log.d(TAG, "Failed loading thumb: " + cleanUrl, t);
-            } finally {
-                if (sc != null && sc.conn != null) sc.conn.disconnect();
+            });
+        } catch (java.util.concurrent.RejectedExecutionException ree) {
+            Log.d(TAG, "Thumbnail pool busy, skipping thumb: " + cleanUrl);
+        }
+    }
+
+    /**
+     * Decodes raw image bytes into a Bitmap while enforcing strict raw/output dimension and
+     * pixel-count budgets to prevent memory exhaustion on decompression bombs (e.g. WebP->PNG).
+     * Returns null if image dimensions are invalid or exceed the hard conversion budget.
+     */
+    public static Bitmap decodeBoundedForConversion(byte[] data) {
+        if (data == null || data.length == 0) return null;
+        try {
+            BitmapFactory.Options opts = new BitmapFactory.Options();
+            opts.inJustDecodeBounds = true;
+            BitmapFactory.decodeByteArray(data, 0, data.length, opts);
+            int w = opts.outWidth;
+            int h = opts.outHeight;
+            if (w <= 0 || h <= 0) return null;
+            if (w > MAX_CONVERT_RAW_DIM || h > MAX_CONVERT_RAW_DIM || ((long) w * (long) h) > MAX_CONVERT_RAW_PIXELS) {
+                Log.w(TAG, "Rejected oversized image for conversion: " + w + "x" + h);
+                return null;
             }
-        });
+            int sample = 1;
+            while ((w / sample) > MAX_CONVERT_OUT_DIM
+                    || (h / sample) > MAX_CONVERT_OUT_DIM
+                    || ((long) (w / sample) * (long) (h / sample)) > MAX_CONVERT_OUT_PIXELS) {
+                sample *= 2;
+            }
+            opts.inSampleSize = Math.max(1, sample);
+            opts.inJustDecodeBounds = false;
+            return BitmapFactory.decodeByteArray(data, 0, data.length, opts);
+        } catch (Throwable t) {
+            Log.w(TAG, "decodeBoundedForConversion failed: " + t.getMessage());
+            return null;
+        }
     }
 
     /**

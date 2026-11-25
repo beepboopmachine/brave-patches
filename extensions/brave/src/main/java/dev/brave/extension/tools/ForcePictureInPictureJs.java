@@ -26,9 +26,14 @@ public final class ForcePictureInPictureJs {
     }
 
     /**
-     * Removes disablepictureinpicture restrictions on all current and future HTML5 <video> elements,
-     * including existing and dynamically attached Shadow DOM roots, and overrides
+     * Removes disablepictureinpicture restrictions on HTML5 <video> elements in the document,
+     * open Shadow DOM roots, and any Shadow DOM roots attached after script injection (including
+     * closed roots returned by wrapped attachShadow()), and overrides
      * HTMLVideoElement.prototype.disablePictureInPicture.
+     *
+     * Limitation: closed Shadow DOM roots created before ON_NAVIGATION_FINISH injection cannot be
+     * enumerated from page context because element.shadowRoot returns null for pre-existing
+     * closed roots.
      */
     public static String getEnableJs() {
         return "(() => {"

@@ -16,6 +16,9 @@ public final class HlsParser {
     private static final String TAG = "Brave_HlsParser";
 
     public static final int MAX_PLAYLIST_CHARS = 16 * 1024 * 1024; // 16M chars safety cap
+    public static final int MAX_MEDIA_SEGMENTS = 50_000;
+    public static final int MAX_MASTER_VARIANTS = 256;
+    public static final int MAX_AUDIO_RENDITIONS = 256;
 
     // Match BANDWIDTH= after start, ':', or ',' (still excludes AVERAGE-BANDWIDTH=)
     private static final Pattern BANDWIDTH_PATTERN = Pattern.compile("(?:^|[:,])BANDWIDTH=(\\d+)");
@@ -30,30 +33,46 @@ public final class HlsParser {
 
     private static final Pattern MEDIA_SEQUENCE_PATTERN = Pattern.compile("#EXT-X-MEDIA-SEQUENCE:(\\d+)");
     private static final Pattern MAP_URI_PATTERN = Pattern.compile("URI=\"([^\"]+)\"");
-    private static final Pattern MAP_BYTERANGE_PATTERN = Pattern.compile("BYTERANGE=\"(\\d+)(?:@(\\d+))?\"");
+    private static final Pattern MAP_BYTERANGE_PATTERN = Pattern.compile("BYTERANGE=\"([^\"]*)\"");
+    private static final Pattern BYTERANGE_VALUE_PATTERN = Pattern.compile("(\\d+)(?:@(\\d+))?");
     private static final Pattern BYTERANGE_PATTERN = Pattern.compile("#EXT-X-BYTERANGE:(\\d+)(?:@(\\d+))?");
-    private static final Pattern KEY_METHOD_PATTERN = Pattern.compile("METHOD=([^,\\s]+)");
-    private static final Pattern KEY_URI_PATTERN = Pattern.compile("URI=\"([^\"]+)\"");
-    private static final Pattern KEY_IV_PATTERN = Pattern.compile("IV=([^,\\s]+)");
+    private static final Pattern KEY_METHOD_PATTERN = Pattern.compile("(?:^|[:,])METHOD=([^,\\s]+)");
+    private static final Pattern KEY_URI_PATTERN = Pattern.compile("(?:^|[:,])URI=\"([^\"]+)\"");
+    private static final Pattern KEY_IV_PATTERN = Pattern.compile("(?:^|[:,])IV=([^,\\s]+)");
+    private static final Pattern KEY_FORMAT_PATTERN = Pattern.compile("(?:^|[:,])KEYFORMAT=\"([^\"]*)\"");
 
     public static class KeyInfo {
         public final String method;
         public final String uri;
         public final String ivHex;
+        public final String keyFormat;
 
         public KeyInfo(String method, String uri, String ivHex) {
-            this.method = method != null ? method : "NONE";
+            this(method, uri, ivHex, "identity");
+        }
+
+        public KeyInfo(String method, String uri, String ivHex, String keyFormat) {
+            this.method = (method != null && !method.isEmpty()) ? method : "NONE";
             this.uri = uri;
             this.ivHex = ivHex;
+            this.keyFormat = (keyFormat != null && !keyFormat.isEmpty()) ? keyFormat : "identity";
+        }
+
+        public boolean isNone() {
+            return "NONE".equalsIgnoreCase(method);
         }
 
         public boolean isAes128() {
-            return "AES-128".equalsIgnoreCase(method);
+            return "AES-128".equalsIgnoreCase(method) && "identity".equalsIgnoreCase(keyFormat);
         }
 
         public boolean isDrm() {
-            return "SAMPLE-AES".equalsIgnoreCase(method) || "SAMPLE-AES-CTR".equalsIgnoreCase(method)
-                    || (uri != null && uri.contains("urn:uuid:"));
+            return isUnsupportedEncryption();
+        }
+
+        public boolean isUnsupportedEncryption() {
+            if (isNone()) return false;
+            return !isAes128() || (uri != null && uri.contains("urn:uuid:"));
         }
     }
 
@@ -108,6 +127,46 @@ public final class HlsParser {
         return playlistText.contains("#EXT-X-I-FRAMES-ONLY");
     }
 
+    public static boolean hasUnsupportedEncryption(String playlistText) {
+        if (playlistText == null || playlistText.isEmpty() || !playlistText.contains("#EXT-X-KEY:")) {
+            return false;
+        }
+        try (BufferedReader reader = new BufferedReader(new StringReader(playlistText))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                line = line.trim();
+                if (line.startsWith("#EXT-X-KEY:")) {
+                    KeyInfo key = parseKeyTag("", line);
+                    if (key.isUnsupportedEncryption()) {
+                        return true;
+                    }
+                }
+            }
+        } catch (IOException ignored) {}
+        return false;
+    }
+
+    private static KeyInfo parseKeyTag(String baseUrl, String line) {
+        String method = "NONE";
+        String keyUri = null;
+        String iv = null;
+        String keyFormat = "identity";
+
+        Matcher mMatch = KEY_METHOD_PATTERN.matcher(line);
+        if (mMatch.find()) method = mMatch.group(1);
+
+        Matcher uMatch = KEY_URI_PATTERN.matcher(line);
+        if (uMatch.find()) keyUri = resolveUrl(baseUrl, uMatch.group(1));
+
+        Matcher iMatch = KEY_IV_PATTERN.matcher(line);
+        if (iMatch.find()) iv = iMatch.group(1);
+
+        Matcher fMatch = KEY_FORMAT_PATTERN.matcher(line);
+        if (fMatch.find()) keyFormat = fMatch.group(1);
+
+        return new KeyInfo(method, keyUri, iv, keyFormat);
+    }
+
     /**
      * Parses a master playlist to extract quality variants and associated EXT-X-MEDIA audio renditions.
      */
@@ -142,7 +201,13 @@ public final class HlsParser {
                     if (defM.find() && "YES".equalsIgnoreCase(defM.group(1))) prio = 3;
 
                     Integer prevPrio = audioGroupPriority.get(groupId);
-                    if (prevPrio == null || prio > prevPrio) {
+                    if (prevPrio == null) {
+                        if (audioGroupUri.size() >= MAX_AUDIO_RENDITIONS) {
+                            throw new IllegalArgumentException("HLS master playlist exceeds maximum audio renditions (" + MAX_AUDIO_RENDITIONS + ")");
+                        }
+                        audioGroupPriority.put(groupId, prio);
+                        audioGroupUri.put(groupId, resolvedAudio);
+                    } else if (prio > prevPrio) {
                         audioGroupPriority.put(groupId, prio);
                         audioGroupUri.put(groupId, resolvedAudio);
                     }
@@ -193,6 +258,9 @@ public final class HlsParser {
                     }
                 } else if (!line.startsWith("#") && !line.isEmpty()) {
                     if (expectVariantUri) {
+                        if (variants.size() >= MAX_MASTER_VARIANTS) {
+                            throw new IllegalArgumentException("HLS master playlist exceeds maximum variants (" + MAX_MASTER_VARIANTS + ")");
+                        }
                         String resolvedUrl = resolveUrl(baseUrl, line);
                         String resolvedAudioUrl = (!lastAudioGroup.isEmpty() && audioGroupUri.containsKey(lastAudioGroup))
                                 ? audioGroupUri.get(lastAudioGroup)
@@ -242,6 +310,8 @@ public final class HlsParser {
             long currentInitBrLen = -1;
             long currentInitBrOff = -1;
             KeyInfo currentInitKey = null;
+            String lastInitByteRangeUri = null;
+            long lastInitByteRangeEnd = 0;
 
             long nextByteRangeLen = -1;
             long nextByteRangeOff = -1;
@@ -260,38 +330,55 @@ public final class HlsParser {
                             mediaSequence = Long.parseLong(seqMatch.group(1));
                         } catch (Exception ignored) {}
                     }
-                } else if (line.startsWith("#EXT-X-DISCONTINUITY")) {
+                } else if (line.equals("#EXT-X-DISCONTINUITY")) {
                     pendingDiscontinuity = true;
                 } else if (line.startsWith("#EXT-X-MAP:")) {
                     Matcher mapMatch = MAP_URI_PATTERN.matcher(line);
-                    if (mapMatch.find()) {
-                        currentInitSegment = resolveUrl(baseUrl, mapMatch.group(1));
-                        currentInitKey = currentKey;
-                        currentInitBrLen = -1;
-                        currentInitBrOff = -1;
-                        Matcher mapBr = MAP_BYTERANGE_PATTERN.matcher(line);
-                        if (mapBr.find()) {
-                            try {
-                                currentInitBrLen = Long.parseLong(mapBr.group(1));
-                                currentInitBrOff = (mapBr.group(2) != null) ? Long.parseLong(mapBr.group(2)) : 0L;
-                            } catch (Exception ignored) {}
+                    if (!mapMatch.find()) {
+                        throw new IllegalArgumentException("Malformed EXT-X-MAP tag missing URI: " + line);
+                    }
+                    currentInitSegment = resolveUrl(baseUrl, mapMatch.group(1));
+                    currentInitKey = currentKey;
+                    currentInitBrLen = -1;
+                    currentInitBrOff = -1;
+                    if (line.contains("BYTERANGE=")) {
+                        Matcher mapBrAttr = MAP_BYTERANGE_PATTERN.matcher(line);
+                        if (!mapBrAttr.find()) {
+                            throw new IllegalArgumentException("Malformed EXT-X-MAP BYTERANGE attribute: " + line);
                         }
+                        Matcher valM = BYTERANGE_VALUE_PATTERN.matcher(mapBrAttr.group(1).trim());
+                        if (!valM.matches()) {
+                            throw new IllegalArgumentException("Malformed EXT-X-MAP BYTERANGE value: " + line);
+                        }
+                        try {
+                            currentInitBrLen = Long.parseLong(valM.group(1));
+                            if (currentInitBrLen <= 0) {
+                                throw new IllegalArgumentException("EXT-X-MAP BYTERANGE length must be > 0: " + line);
+                            }
+                            if (valM.group(2) != null) {
+                                currentInitBrOff = Long.parseLong(valM.group(2));
+                            } else {
+                                if (lastInitByteRangeUri == null || !currentInitSegment.equals(lastInitByteRangeUri)) {
+                                    throw new IllegalArgumentException(
+                                            "EXT-X-MAP BYTERANGE without offset requires preceding init section of same URI: " + currentInitSegment
+                                    );
+                                }
+                                currentInitBrOff = lastInitByteRangeEnd;
+                            }
+                        } catch (NumberFormatException nfe) {
+                            throw new IllegalArgumentException("Invalid EXT-X-MAP BYTERANGE values: " + line, nfe);
+                        }
+                        if (currentInitBrOff > Long.MAX_VALUE - currentInitBrLen) {
+                            throw new IllegalArgumentException("EXT-X-MAP BYTERANGE offset+length overflow");
+                        }
+                        lastInitByteRangeUri = currentInitSegment;
+                        lastInitByteRangeEnd = currentInitBrOff + currentInitBrLen;
+                    } else {
+                        lastInitByteRangeUri = null;
+                        lastInitByteRangeEnd = 0L;
                     }
                 } else if (line.startsWith("#EXT-X-KEY:")) {
-                    String method = "NONE";
-                    String keyUri = null;
-                    String iv = null;
-
-                    Matcher mMatch = KEY_METHOD_PATTERN.matcher(line);
-                    if (mMatch.find()) method = mMatch.group(1);
-
-                    Matcher uMatch = KEY_URI_PATTERN.matcher(line);
-                    if (uMatch.find()) keyUri = resolveUrl(baseUrl, uMatch.group(1));
-
-                    Matcher iMatch = KEY_IV_PATTERN.matcher(line);
-                    if (iMatch.find()) iv = iMatch.group(1);
-
-                    currentKey = new KeyInfo(method, keyUri, iv);
+                    currentKey = parseKeyTag(baseUrl, line);
                 } else if (line.startsWith("#EXT-X-BYTERANGE:")) {
                     Matcher brMatch = BYTERANGE_PATTERN.matcher(line);
                     if (!brMatch.matches()) {
@@ -345,6 +432,9 @@ public final class HlsParser {
                             lastByteRangeEnd = 0L;
                         }
 
+                        if (segments.size() >= MAX_MEDIA_SEGMENTS) {
+                            throw new IllegalArgumentException("HLS media playlist exceeds maximum segments (" + MAX_MEDIA_SEGMENTS + ")");
+                        }
                         segments.add(new SegmentInfo(
                                 resolvedUrl,
                                 currentDuration,

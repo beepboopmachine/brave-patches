@@ -3,7 +3,6 @@ package dev.brave.extension.media;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.Dialog;
-import android.app.DownloadManager;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
@@ -13,7 +12,6 @@ import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
-import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.DisplayMetrics;
@@ -63,35 +61,37 @@ public final class MediaPickerBottomSheet {
     public static volatile boolean sBulkImagesDownloading = false;
 
     // Live UI callbacks for open bottom sheets when background service downloads finish
-    private static final java.util.Map<String, java.lang.ref.WeakReference<java.util.function.Consumer<Boolean>>> DOWNLOAD_UI_CALLBACKS =
+    private static final java.util.Map<String, java.util.function.Consumer<Boolean>> DOWNLOAD_UI_CALLBACKS =
             new ConcurrentHashMap<>();
 
     public static void notifyDownloadFinished(final String url, final boolean success) {
         if (url == null || url.isEmpty()) return;
-        java.lang.ref.WeakReference<java.util.function.Consumer<Boolean>> ref = DOWNLOAD_UI_CALLBACKS.remove(url);
-        if (ref != null) {
-            final java.util.function.Consumer<Boolean> cb = ref.get();
-            if (cb != null) {
-                new Handler(Looper.getMainLooper()).post(() -> {
-                    try { cb.accept(success); } catch (Throwable ignored) {}
-                });
-            }
+        final java.util.function.Consumer<Boolean> cb = DOWNLOAD_UI_CALLBACKS.remove(url);
+        if (cb != null) {
+            new Handler(Looper.getMainLooper()).post(() -> {
+                try { cb.accept(success); } catch (Throwable ignored) {}
+            });
         }
     }
 
     private static void registerButtonCompletionCallback(final String url, final Activity activity, final Button dlBtn, final boolean isDark) {
-        if (url == null || url.isEmpty() || dlBtn == null) return;
-        DOWNLOAD_UI_CALLBACKS.put(url, new java.lang.ref.WeakReference<>(success -> {
+        if (url == null || url.isEmpty() || dlBtn == null || activity == null) return;
+        final java.lang.ref.WeakReference<Activity> actRef = new java.lang.ref.WeakReference<>(activity);
+        final java.lang.ref.WeakReference<Button> btnRef = new java.lang.ref.WeakReference<>(dlBtn);
+        DOWNLOAD_UI_CALLBACKS.put(url, success -> {
+            Activity act = actRef.get();
+            Button btn = btnRef.get();
+            if (act == null || btn == null) return;
             if (success) {
-                dlBtn.setText("DOWNLOADED ✓");
-                dlBtn.setEnabled(true);
-                styleButton(dlBtn, Color.parseColor(isDark ? "#143D1A" : "#D4EDDA"), Color.parseColor(isDark ? "#81C784" : "#155724"), dp(activity, 6));
+                btn.setText("DOWNLOADED ✓");
+                btn.setEnabled(true);
+                styleButton(btn, Color.parseColor(isDark ? "#143D1A" : "#D4EDDA"), Color.parseColor(isDark ? "#81C784" : "#155724"), dp(act, 6));
             } else {
-                dlBtn.setText("Download");
-                dlBtn.setEnabled(true);
-                styleButton(dlBtn, Color.parseColor("#FF5500"), Color.WHITE, dp(activity, 6));
+                btn.setText("Download");
+                btn.setEnabled(true);
+                styleButton(btn, Color.parseColor("#FF5500"), Color.WHITE, dp(act, 6));
             }
-        }));
+        });
     }
 
     private static volatile Method sNativeDownloadUrlMethod = null;
@@ -241,9 +241,9 @@ public final class MediaPickerBottomSheet {
             }
         }
 
-        int resolvedTabId = ActiveTabTracker.getActiveTabId();
+        int resolvedTabId = ActiveTabTracker.getActiveTabId(activity);
         if (resolvedTabId < 0) {
-            Tab tab = ActiveTabTracker.getActiveTab();
+            Tab tab = ActiveTabTracker.getActiveTab(activity);
             if (tab != null) {
                 try {
                     resolvedTabId = tab.getId();
@@ -600,14 +600,7 @@ public final class MediaPickerBottomSheet {
         contentArea.addView(imagesContainer);
         root.addView(contentArea);
 
-        // Populate Videos Tab
-        if (videos.isEmpty()) {
-            videoList.addView(createEmptyState(activity, "No video or audio streams detected on this page.", subTextColor));
-        } else {
-            for (int i = 0; i < videos.size(); i++) {
-                videoList.addView(createVideoCard(activity, videos.get(i), i, videos.size(), isDark, cardBgColor, textColor, subTextColor, accentColor));
-            }
-        }
+        // Initial videos population handled by refreshDisplayedLists() below so live scans update in-place.
 
         // Google Photos-style Drag Select Controller
         class DragSelectController implements DragSelectListener {
@@ -725,18 +718,68 @@ public final class MediaPickerBottomSheet {
 
         final DragSelectController dragController = new DragSelectController();
 
-        if (images.isEmpty()) {
-            imageList.addView(createEmptyState(activity, "No high-resolution images detected on this page.", subTextColor));
-        } else {
-            for (int i = 0; i < images.size(); i++) {
-                final MediaItem item = images.get(i);
-                final CheckBox cb = new CheckBox(activity);
-                imageCheckBoxes.add(cb);
-                View imgCard = createImageCard(activity, item, i, cb, isDark, cardBgColor, textColor, subTextColor, selectedImages, dragController);
-                imageRowViews.add(imgCard);
-                imageList.addView(imgCard);
+        final java.util.Set<String> renderedVideoUrls = new java.util.HashSet<>();
+        final java.util.Set<String> renderedImageUrls = new java.util.HashSet<>();
+        final Runnable refreshDisplayedLists = () -> {
+            List<MediaItem> latestVideos = MediaRegistry.getMediaForTab(tabId);
+            List<MediaItem> latestImages = MediaRegistry.getImagesForTab(tabId);
+
+            videos.clear();
+            videos.addAll(latestVideos);
+            images.clear();
+            images.addAll(latestImages);
+
+            tabVideos.setText("Videos / Streams (" + videos.size() + ")");
+            tabImages.setText("Images (" + images.size() + ")");
+
+            if (videos.isEmpty()) {
+                if (renderedVideoUrls.isEmpty() && videoList.getChildCount() == 0) {
+                    videoList.addView(createEmptyState(activity, "No video or audio streams detected on this page.", subTextColor));
+                }
+            } else {
+                if (renderedVideoUrls.isEmpty() && videoList.getChildCount() > 0) {
+                    videoList.removeAllViews();
+                }
+                for (int i = 0; i < videos.size(); i++) {
+                    MediaItem v = videos.get(i);
+                    if (v != null && v.url != null && renderedVideoUrls.add(v.url)) {
+                        videoList.addView(createVideoCard(activity, v, i, videos.size(), isDark, cardBgColor, textColor, subTextColor, accentColor));
+                    }
+                }
             }
-        }
+
+            if (images.isEmpty()) {
+                if (renderedImageUrls.isEmpty() && imageList.getChildCount() == 0) {
+                    imageList.addView(createEmptyState(activity, "No high-resolution images detected on this page.", subTextColor));
+                }
+            } else {
+                if (renderedImageUrls.isEmpty() && imageList.getChildCount() > 0) {
+                    imageList.removeAllViews();
+                }
+                for (int i = 0; i < images.size(); i++) {
+                    final MediaItem item = images.get(i);
+                    if (item != null && item.url != null && renderedImageUrls.add(item.url)) {
+                        final int rowIdx = imageRowViews.size();
+                        final CheckBox cb = new CheckBox(activity);
+                        imageCheckBoxes.add(cb);
+                        View imgCard = createImageCard(activity, item, rowIdx, cb, isDark, cardBgColor, textColor, subTextColor, selectedImages, dragController);
+                        imageRowViews.add(imgCard);
+                        imageList.addView(imgCard);
+                    }
+                }
+            }
+            updateBulkButtonState.run();
+        };
+
+        refreshDisplayedLists.run();
+
+        final MediaRegistry.MediaCountListener liveListener = (changedTabId, mediaCount, imageCount) -> {
+            if (changedTabId != tabId) return;
+            if (!dialog.isShowing() || activity.isFinishing()) return;
+            refreshDisplayedLists.run();
+        };
+        MediaRegistry.addListener(liveListener);
+        dialog.setOnDismissListener(d -> MediaRegistry.removeListener(liveListener));
 
         tabVideos.setOnClickListener(v -> {
             setTabActive(activity, tabVideos, true, accentColor, cardBgColor);
@@ -817,11 +860,10 @@ public final class MediaPickerBottomSheet {
                     : finalFilename;
 
             final java.util.concurrent.atomic.AtomicBoolean itemHandled = new java.util.concurrent.atomic.AtomicBoolean(false);
-            final java.util.function.Consumer<Boolean> finishItem = (succeeded) -> {
+            final java.util.function.BiConsumer<Boolean, String> finishItem = (succeeded, actualSavedName) -> {
                 if (!itemHandled.compareAndSet(false, true)) return;
                 if (succeeded) {
                     successCount.incrementAndGet();
-                    PatchPrefs.markMediaDownloaded(activity, im.url, expectedSavedName);
                 }
                 int done = finishedCount.incrementAndGet();
                 if (done >= total) {
@@ -830,10 +872,10 @@ public final class MediaPickerBottomSheet {
                     mainHandler.post(() -> {
                         bulkBtn.setEnabled(true);
                         if (ok == total) {
-                            bulkBtn.setText("ALL DOWNLOADED ✓ (" + total + " Images)");
-                            styleButton(bulkBtn, Color.parseColor(isDark ? "#143D1A" : "#D4EDDA"), Color.parseColor(isDark ? "#81C784" : "#155724"), dp(activity, 8));
+                            bulkBtn.setText("SENT TO BRAVE (" + total + " Images)");
+                            styleButton(bulkBtn, Color.parseColor(isDark ? "#0D3B5E" : "#D6EAFA"), Color.parseColor(isDark ? "#90CAF9" : "#0D47A1"), dp(activity, 8));
                         } else if (ok > 0) {
-                            bulkBtn.setText("Downloaded " + ok + "/" + total + " (Tap to Retry)");
+                            bulkBtn.setText("Sent " + ok + "/" + total + " to Brave (Tap to Retry)");
                             styleButton(bulkBtn, Color.parseColor(isDark ? "#4A2800" : "#FFE0B2"), Color.parseColor(isDark ? "#FFA726" : "#E65100"), dp(activity, 8));
                         } else {
                             bulkBtn.setText("Download Failed (Tap to Retry)");
@@ -847,12 +889,13 @@ public final class MediaPickerBottomSheet {
 
             String relayUrl = LocalDownloadRelay.startRelay(im, finalFilename, finalMime, convertWebp, finishItem);
             if (relayUrl == null) {
-                finishItem.accept(false);
+                finishItem.accept(false, finalFilename);
                 return;
             }
-            boolean triggered = triggerChromiumNativeDownload(relayUrl);
+            boolean triggered = triggerChromiumNativeDownload(activity, relayUrl);
             if (!triggered) {
-                finishItem.accept(false);
+                LocalDownloadRelay.stopRelay(relayUrl);
+                finishItem.accept(false, finalFilename);
             }
         };
 
@@ -860,7 +903,7 @@ public final class MediaPickerBottomSheet {
             mainHandler.postDelayed(dispatchNextRef[0], w * 150L);
         }
 
-        Toast.makeText(activity, "Downloading " + total + " image(s) in Brave Downloads", Toast.LENGTH_SHORT).show();
+        Toast.makeText(activity, "Sending " + total + " image(s) to Brave Downloads...", Toast.LENGTH_SHORT).show();
     }
 
     /**
@@ -870,9 +913,15 @@ public final class MediaPickerBottomSheet {
      * and native Brave download notifications!
      */
     public static boolean triggerChromiumNativeDownload(final String url) {
+        return triggerChromiumNativeDownload(null, url);
+    }
+
+    public static boolean triggerChromiumNativeDownload(final Activity activity, final String url) {
         if (url == null || url.isEmpty()) return false;
         try {
-            Tab activeTab = ActiveTabTracker.getActiveTab();
+            Tab activeTab = (activity != null)
+                    ? ActiveTabTracker.getActiveTab(activity)
+                    : ActiveTabTracker.getActiveTab();
             if (activeTab == null) return false;
             WebContents wc = activeTab.getWebContents();
             if (wc == null) return false;
@@ -1160,7 +1209,7 @@ public final class MediaPickerBottomSheet {
         else if (mimeLower.equals("audio/wav") || pathLower.endsWith(".wav")) { ext = ".wav"; defaultMime = "audio/wav"; }
         else if (mimeLower.equals("video/mp4") || pathLower.endsWith(".mp4") || pathLower.endsWith(".m4v")) { ext = ".mp4"; defaultMime = "video/mp4"; }
 
-        final String resolvedMime = (item.mimeType != null && !item.mimeType.isEmpty()) ? item.mimeType : defaultMime;
+        final String resolvedMime = NetworkSafety.sanitizeMimeType(item.mimeType, defaultMime);
         String clean = getCleanFileName(item.url);
         String lowerClean = clean.toLowerCase(Locale.ROOT);
         if (lowerClean.equals("videoplayback") || lowerClean.equals("video") || lowerClean.equals("media")
@@ -1174,16 +1223,15 @@ public final class MediaPickerBottomSheet {
         }
         final String filename = clean.contains(".") ? clean : (clean + ext);
 
-        final java.util.function.Consumer<Boolean> updateButtonOnFinish = (succeeded) -> {
+        // Distinguish RELAY_TRANSFERRED (handed over loopback socket to Brave DownloadManager; final disk write is native-owned)
+        // from verified DOWNLOAD_COMPLETED in MediaDownloadService.
+        final java.util.function.Consumer<Boolean> updateButtonOnRelayHandoff = (transferred) -> {
             ACTIVE_DOWNLOAD_URLS.remove(item.url);
-            if (succeeded) {
-                PatchPrefs.markMediaDownloaded(activity, item.url, filename);
-            }
             new Handler(Looper.getMainLooper()).post(() -> {
                 dlBtn.setEnabled(true);
-                if (succeeded) {
-                    dlBtn.setText("DOWNLOADED ✓");
-                    styleButton(dlBtn, Color.parseColor(isDark ? "#143D1A" : "#D4EDDA"), Color.parseColor(isDark ? "#81C784" : "#155724"), dp(activity, 6));
+                if (transferred) {
+                    dlBtn.setText("IN BRAVE DOWNLOADS");
+                    styleButton(dlBtn, Color.parseColor(isDark ? "#0D3B5E" : "#D6EAFA"), Color.parseColor(isDark ? "#90CAF9" : "#0D47A1"), dp(activity, 6));
                 } else {
                     dlBtn.setText("Download");
                     styleButton(dlBtn, Color.parseColor("#FF5500"), Color.WHITE, dp(activity, 6));
@@ -1201,52 +1249,34 @@ public final class MediaPickerBottomSheet {
                     filename,
                     null,
                     muxRelayUrl -> {
-                        if (!triggerChromiumNativeDownload(muxRelayUrl)) {
-                            updateButtonOnFinish.accept(false);
+                        if (!triggerChromiumNativeDownload(activity, muxRelayUrl)) {
+                            LocalDownloadRelay.stopRelay(muxRelayUrl);
+                            updateButtonOnRelayHandoff.accept(false);
                         }
                     },
-                    updateButtonOnFinish
+                    updateButtonOnRelayHandoff
             );
             return;
         }
 
-        // 1. Primary path: Stream via authenticated 1-shot LocalDownloadRelay into Brave's native DownloadManager
-        String relayUrl = LocalDownloadRelay.startRelay(item, filename, resolvedMime, updateButtonOnFinish);
+        // 1. Primary path: Stream via authenticated LocalDownloadRelay into Brave's native DownloadManager
+        String relayUrl = LocalDownloadRelay.startRelay(
+                item, filename, resolvedMime, false,
+                (transferred, actualServedName) -> updateButtonOnRelayHandoff.accept(transferred)
+        );
 
-        if (relayUrl != null && triggerChromiumNativeDownload(relayUrl)) {
-            Toast.makeText(activity, "Downloading in Brave Downloads: " + filename, Toast.LENGTH_SHORT).show();
+        if (relayUrl != null && triggerChromiumNativeDownload(activity, relayUrl)) {
+            Toast.makeText(activity, "Sending to Brave Downloads: " + filename, Toast.LENGTH_SHORT).show();
             return;
         }
-
-        // 2. Fallback: Android system DownloadManager (with safe Referer & Cookie)
-        try {
-            DownloadManager dm = (DownloadManager) activity.getSystemService(Context.DOWNLOAD_SERVICE);
-            if (dm != null) {
-                String refPage = (item.pageUrl != null && !item.pageUrl.isEmpty()) ? item.pageUrl : item.referer;
-                String safeRef = NetworkSafety.computeSafeReferer(refPage, item.url);
-                String safeCookie = NetworkSafety.computeSafeCookie(item.cookie, item.cookieSourceUrl, item.url);
-                DownloadManager.Request req = new DownloadManager.Request(Uri.parse(item.url));
-                req.setTitle(item.title != null && !item.title.isEmpty() ? item.title : filename);
-                req.setDescription("Downloading " + filename);
-                req.setMimeType(resolvedMime);
-                if (item.userAgent != null && !item.userAgent.isEmpty()) req.addRequestHeader("User-Agent", item.userAgent);
-                if (!safeCookie.isEmpty()) req.addRequestHeader("Cookie", safeCookie);
-                if (!safeRef.isEmpty()) req.addRequestHeader("Referer", safeRef);
-                req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
-                req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, filename);
-                dm.enqueue(req);
-                ACTIVE_DOWNLOAD_URLS.remove(item.url);
-                dlBtn.setText("Download");
-                dlBtn.setEnabled(true);
-                styleButton(dlBtn, Color.parseColor("#FF5500"), Color.WHITE, dp(activity, 6));
-                Toast.makeText(activity, "Download started: " + filename, Toast.LENGTH_SHORT).show();
-                return;
-            }
-        } catch (Throwable t) {
-            Log.w(TAG, "DownloadManager fallback failed", t);
+        if (relayUrl != null) {
+            LocalDownloadRelay.stopRelay(relayUrl);
         }
 
-        updateButtonOnFinish.accept(false);
+        // 2. Secure Fallback: MediaDownloadService (SSRF DNS-pinned, scheme/path-scoped cookies, verified disk completion)
+        item.trackingUrl = item.url;
+        registerButtonCompletionCallback(item.url, activity, dlBtn, isDark);
+        startMediaDownload(activity, item, dlBtn);
     }
 
     private static void showQualitySelectorAndDownload(
@@ -1406,7 +1436,8 @@ public final class MediaPickerBottomSheet {
             intent.putExtra(MediaDownloadService.EXTRA_JOB_ID, jobId);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(intent);
             else ctx.startService(intent);
-            Toast.makeText(ctx, "Starting HLS download...", Toast.LENGTH_SHORT).show();
+            String toastMsg = (item.type == MediaType.HLS_STREAM) ? "Starting HLS download..." : "Starting download...";
+            Toast.makeText(ctx, toastMsg, Toast.LENGTH_SHORT).show();
         } catch (Throwable t) {
             MediaDownloadService.PENDING_JOBS.remove(jobId);
             ACTIVE_DOWNLOAD_URLS.remove(item.url);

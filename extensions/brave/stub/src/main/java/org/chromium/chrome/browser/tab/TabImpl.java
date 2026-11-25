@@ -11,5 +11,6 @@ public class TabImpl implements Tab {
     @Override public boolean isIncognito() { return false; }
     @Override public boolean isClosing() { return false; }
     @Override public Context getContext() { return null; }
+    @Override public Context p() { return null; }
     public int destroyInternal(boolean z) { return 0; }
 }

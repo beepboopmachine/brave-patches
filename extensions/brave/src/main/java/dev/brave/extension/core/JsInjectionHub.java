@@ -197,28 +197,35 @@ public final class JsInjectionHub {
             bindFactoryBridge(tab, webContents, entry.getKey(), entry.getValue(), origin);
         }
         for (Map.Entry<String, Object> entry : STATIC_BRIDGES.entrySet()) {
-            String bridgeName = entry.getKey();
-            BoundBridge existing = getBoundBridge(webContents, bridgeName);
-            if (existing != null && origin.equals(existing.origin)) {
-                continue;
-            }
-            registerBridge(webContents, entry.getValue(), bridgeName, origin);
-            putBoundBridge(webContents, bridgeName, new BoundBridge(origin, ""));
+            final String bridgeName = entry.getKey();
+            final Object bridgeObj = entry.getValue();
+            postToMain(() -> {
+                BoundBridge existing = getBoundBridge(webContents, bridgeName);
+                if (existing != null && origin.equals(existing.origin)) {
+                    return;
+                }
+                if (registerBridgeOnMain(webContents, bridgeObj, bridgeName, origin)) {
+                    putBoundBridge(webContents, bridgeName, new BoundBridge(origin, ""));
+                }
+            });
         }
     }
 
     private static void bindFactoryBridge(Tab tab, WebContents webContents, String bridgeName, BridgeFactory factory, String origin) {
-        BoundBridge existing = getBoundBridge(webContents, bridgeName);
-        if (existing != null && origin.equals(existing.origin)) {
-            return;
-        }
-        String token = NetworkSafety.generateRandomTokenHex(16);
-        int tabId = tab != null ? tab.getId() : -1;
-        Object bridgeObj = factory.create(tabId, webContents, origin, token);
-        if (bridgeObj != null) {
-            putBoundBridge(webContents, bridgeName, new BoundBridge(origin, token));
-            registerBridge(webContents, bridgeObj, bridgeName, origin);
-        }
+        postToMain(() -> {
+            BoundBridge existing = getBoundBridge(webContents, bridgeName);
+            if (existing != null && origin.equals(existing.origin)) {
+                return;
+            }
+            String token = NetworkSafety.generateRandomTokenHex(16);
+            int tabId = tab != null ? tab.getId() : -1;
+            Object bridgeObj = factory.create(tabId, webContents, origin, token);
+            if (bridgeObj != null) {
+                if (registerBridgeOnMain(webContents, bridgeObj, bridgeName, origin)) {
+                    putBoundBridge(webContents, bridgeName, new BoundBridge(origin, token));
+                }
+            }
+        });
     }
 
     private static BoundBridge getBoundBridge(WebContents wc, String bridgeName) {
@@ -262,36 +269,50 @@ public final class JsInjectionHub {
             return;
         }
 
-        postToMain(() -> {
-            OriginMatcher originMatcher = null;
-            try {
-                Object factory = getInjectorFactory();
-                if (factory == null) {
-                    Log.w(TAG, "Cannot register bridge " + bridgeName + ": JavascriptInjector factory not found");
-                    return;
-                }
+        postToMain(() -> registerBridgeOnMain(webContents, bridgeObject, bridgeName, allowedOrigin));
+    }
 
-                JavascriptInjectorImpl injector = null;
-                for (Method m : webContents.getClass().getMethods()) {
-                    if (m.getName().equals("H1") && m.getParameterTypes().length == 2) {
-                        injector = (JavascriptInjectorImpl) m.invoke(webContents, JavascriptInjectorImpl.class, factory);
-                        break;
-                    }
-                }
-                if (injector != null) {
-                    originMatcher = new OriginMatcher();
-                    originMatcher.c(Collections.singletonList(allowedOrigin));
-                    injector.a(bridgeObject, bridgeName, originMatcher);
-                    Log.i(TAG, "Registered bridge " + bridgeName + " scoped to origin " + allowedOrigin);
-                } else {
-                    Log.w(TAG, "Could not resolve JavascriptInjectorImpl on WebContents");
-                }
-            } catch (Throwable t) {
-                Log.e(TAG, "Failed to register bridge " + bridgeName, t);
-            } finally {
-                destroyOriginMatcherSafely(originMatcher);
+    private static boolean registerBridgeOnMain(
+            final WebContents webContents,
+            final Object bridgeObject,
+            final String bridgeName,
+            final String allowedOrigin
+    ) {
+        if (webContents == null || bridgeObject == null || bridgeName == null
+                || allowedOrigin == null || allowedOrigin.isEmpty()) {
+            return false;
+        }
+        OriginMatcher originMatcher = null;
+        try {
+            Object factory = getInjectorFactory();
+            if (factory == null) {
+                Log.w(TAG, "Cannot register bridge " + bridgeName + ": JavascriptInjector factory not found");
+                return false;
             }
-        });
+
+            JavascriptInjectorImpl injector = null;
+            for (Method m : webContents.getClass().getMethods()) {
+                if (m.getName().equals("H1") && m.getParameterTypes().length == 2) {
+                    injector = (JavascriptInjectorImpl) m.invoke(webContents, JavascriptInjectorImpl.class, factory);
+                    break;
+                }
+            }
+            if (injector != null) {
+                originMatcher = new OriginMatcher();
+                originMatcher.c(Collections.singletonList(allowedOrigin));
+                injector.a(bridgeObject, bridgeName, originMatcher);
+                Log.i(TAG, "Registered bridge " + bridgeName + " scoped to origin " + allowedOrigin);
+                return true;
+            } else {
+                Log.w(TAG, "Could not resolve JavascriptInjectorImpl on WebContents");
+                return false;
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed to register bridge " + bridgeName, t);
+            return false;
+        } finally {
+            destroyOriginMatcherSafely(originMatcher);
+        }
     }
 
     private static void destroyOriginMatcherSafely(OriginMatcher matcher) {
@@ -434,16 +455,19 @@ public final class JsInjectionHub {
     }
 
     private static Object getInjectorFactory() {
-        if (sFactoryResolved) return sCachedInjectorFactory;
+        if (sFactoryResolved && sCachedInjectorFactory != null) return sCachedInjectorFactory;
         synchronized (JsInjectionHub.class) {
-            if (!sFactoryResolved) {
+            if (!sFactoryResolved || sCachedInjectorFactory == null) {
                 try {
                     Class<?> l0aClass = Class.forName("l0a");
-                    sCachedInjectorFactory = l0aClass.getField("a").get(null);
+                    Object resolved = l0aClass.getField("a").get(null);
+                    if (resolved != null) {
+                        sCachedInjectorFactory = resolved;
+                        sFactoryResolved = true;
+                    }
                 } catch (Throwable t) {
                     Log.w(TAG, "Could not resolve l0a.a factory", t);
                 }
-                sFactoryResolved = true;
             }
         }
         return sCachedInjectorFactory;

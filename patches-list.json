@@ -482,7 +482,7 @@
     },
     {
       "name": "Stop Background Wakeups",
-      "description": "Disables Chromium's background-sync task scheduler gate to prevent periodic background wakeups.",
+      "description": "Disables Chromium's background-sync task scheduler gate and cancels previously scheduled background-sync jobs.",
       "default": true,
       "category": null,
       "compatiblePackages": [

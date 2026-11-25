@@ -157,21 +157,59 @@ public final class PatchPrefs {
 
         // On Android 10+, also verify via MediaStore (covers Chromium native Downloads)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && baseName != null && !baseName.isEmpty()) {
-            if (existsInMediaStore(context, MediaStore.Downloads.EXTERNAL_CONTENT_URI, baseName)) return true;
-            if (existsInMediaStore(context, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, baseName)) return true;
+            if (existsInMediaStore(
+                    context,
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                    baseName,
+                    new String[]{
+                            Environment.DIRECTORY_DOWNLOADS + "/",
+                            Environment.DIRECTORY_DOWNLOADS + "/BraveMedia/"
+                    }
+            )) {
+                return true;
+            }
+            if (existsInMediaStore(
+                    context,
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    baseName,
+                    new String[]{
+                            Environment.DIRECTORY_PICTURES + "/BraveMedia/",
+                            Environment.DIRECTORY_DOWNLOADS + "/",
+                            Environment.DIRECTORY_DOWNLOADS + "/BraveMedia/"
+                    }
+            )) {
+                return true;
+            }
         }
 
         return false;
     }
 
-    private static boolean existsInMediaStore(Context context, Uri collection, String displayName) {
-        String[] projection = new String[]{MediaStore.MediaColumns._ID, MediaStore.MediaColumns.SIZE};
+    private static boolean existsInMediaStore(
+            Context context,
+            Uri collection,
+            String displayName,
+            String[] allowedRelativePaths
+    ) {
+        String[] projection = new String[]{
+                MediaStore.MediaColumns._ID,
+                MediaStore.MediaColumns.SIZE,
+                MediaStore.MediaColumns.RELATIVE_PATH
+        };
         String selection = MediaStore.MediaColumns.DISPLAY_NAME + "=?";
         try (Cursor c = context.getContentResolver().query(collection, projection, selection, new String[]{displayName}, null)) {
             if (c != null) {
                 while (c.moveToNext()) {
                     long size = c.getLong(1);
-                    if (size > 0) return true;
+                    if (size <= 0) continue;
+                    String relPath = c.getString(2);
+                    if (relPath == null) continue;
+                    String normalized = relPath.endsWith("/") ? relPath : (relPath + "/");
+                    for (String allowed : allowedRelativePaths) {
+                        if (normalized.equalsIgnoreCase(allowed)) {
+                            return true;
+                        }
+                    }
                 }
             }
         } catch (Throwable ignored) {}

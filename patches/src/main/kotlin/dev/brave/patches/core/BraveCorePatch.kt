@@ -27,11 +27,11 @@ val braveCorePatch = patch(
     extendWith("extensions/brave.mpe")
 
     execute {
-        // 1. Hook ActiveTabProvider.k(Tab) at method entry before any registers can be manipulated
+        // 1. Hook ActiveTabProvider.k(Tab) at method entry with both provider (window) and tab
         ActiveTabSwitchFingerprint.method.apply {
             addInstructions(
                 0,
-                "invoke-static/range {p1 .. p1}, $CORE_TRACKER->onActiveTabChanged(Lorg/chromium/chrome/browser/tab/Tab;)V"
+                "invoke-static/range {p0 .. p1}, $CORE_TRACKER->onActiveTabChanged(Ljava/lang/Object;Lorg/chromium/chrome/browser/tab/Tab;)V"
             )
         }
 

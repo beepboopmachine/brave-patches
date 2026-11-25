@@ -16,19 +16,63 @@ public final class MediaSnifferJs {
         "  var MAX_TEXT_SCAN_LEN = 1048576;\n" +
         "  try { console.log('[BraveSniffer] Universal media sniffer active on: ' + window.location.href); } catch(e) {}\n" +
         "\n" +
+        "  var MAX_REPORTED_KEYS = 800;\n" +
+        "  var MAX_PENDING_MEDIA = 150;\n" +
+        "  var MAX_PENDING_IFRAMES = 50;\n" +
         "  var pendingQueue = [];\n" +
         "  var pendingIframeQueue = [];\n" +
         "  var reportedUrls = new Set();\n" +
-        "  var scannedScripts = (typeof WeakSet !== 'undefined') ? new WeakSet() : null;\n" +
+        "  var reportedMeta = new Set();\n" +
+        "  var scannedScripts = (typeof WeakMap !== 'undefined') ? new WeakMap() : null;\n" +
+        "  var observedRoots = (typeof WeakSet !== 'undefined') ? new WeakSet() : null;\n" +
+        "  var queueOverflowed = false;\n" +
+        "  var mediaCategoryFull = false;\n" +
+        "  var imageCategoryFull = false;\n" +
         "  var lastHref = window.location.href;\n" +
+        "\n" +
+        "  function markBoundedKey(set, key) {\n" +
+        "    if (!set || !key) return;\n" +
+        "    if (set.has(key)) {\n" +
+        "      set.delete(key);\n" +
+        "      set.add(key);\n" +
+        "      return;\n" +
+        "    }\n" +
+        "    while (set.size >= MAX_REPORTED_KEYS) {\n" +
+        "      var oldest = set.values().next().value;\n" +
+        "      if (oldest === undefined) break;\n" +
+        "      set.delete(oldest);\n" +
+        "    }\n" +
+        "    set.add(key);\n" +
+        "  }\n" +
+        "\n" +
+        "  function isCategoryFullForType(type) {\n" +
+        "    var isImg = (type === 'IMAGE');\n" +
+        "    if (isImg && imageCategoryFull) return true;\n" +
+        "    if (!isImg && mediaCategoryFull) return true;\n" +
+        "    if (window.BraveMediaBridge && window.BraveMediaBridge.isCategoryFull) {\n" +
+        "      try {\n" +
+        "        var full = !!window.BraveMediaBridge.isCategoryFull(BRIDGE_TOKEN, isImg ? 'IMAGE' : 'VIDEO');\n" +
+        "        if (full) {\n" +
+        "          if (isImg) imageCategoryFull = true;\n" +
+        "          else mediaCategoryFull = true;\n" +
+        "        }\n" +
+        "        return full;\n" +
+        "      } catch(e) {}\n" +
+        "    }\n" +
+        "    return false;\n" +
+        "  }\n" +
         "\n" +
         "  function checkUrlChange() {\n" +
         "    var cur = window.location.href;\n" +
         "    if (cur && cur !== lastHref) {\n" +
         "      lastHref = cur;\n" +
         "      reportedUrls.clear();\n" +
+        "      reportedMeta.clear();\n" +
         "      pendingQueue.length = 0;\n" +
         "      pendingIframeQueue.length = 0;\n" +
+        "      queueOverflowed = false;\n" +
+        "      mediaCategoryFull = false;\n" +
+        "      imageCategoryFull = false;\n" +
         "      try {\n" +
         "        if (window.BraveMediaBridge && window.BraveMediaBridge.onPageUrlChanged) {\n" +
         "          window.BraveMediaBridge.onPageUrlChanged(BRIDGE_TOKEN, cur);\n" +
@@ -54,7 +98,9 @@ public final class MediaSnifferJs {
         "    if (origReplaceState) {\n" +
         "      history.replaceState = function() {\n" +
         "        var r = origReplaceState.apply(this, arguments);\n" +
-        "        checkUrlChange();\n" +
+        "        if (checkUrlChange()) {\n" +
+        "          setTimeout(function() { try { scanDom(); flushQueue(); } catch(e) {} }, 200);\n" +
+        "        }\n" +
         "        return r;\n" +
         "      };\n" +
         "    }\n" +
@@ -89,16 +135,21 @@ public final class MediaSnifferJs {
         "        }\n" +
         "      } catch(e) {}\n" +
         "    }\n" +
+        "    if (queueOverflowed) {\n" +
+        "      queueOverflowed = false;\n" +
+        "      setTimeout(function() { try { scanDom(); flushQueue(); } catch(e) {} }, 50);\n" +
+        "    }\n" +
         "  }\n" +
         "\n" +
         "  function report(url, type, mime, title, width, height, size, dur, thumb, quality) {\n" +
         "    var absUrl = toAbsolute(url);\n" +
-        "    if (!absUrl) return;\n" +
+        "    if (!absUrl) return false;\n" +
         "    var lower = absUrl.toLowerCase();\n" +
-        "    if (!lower.startsWith('http://') && !lower.startsWith('https://')) return;\n" +
+        "    if (!lower.startsWith('http://') && !lower.startsWith('https://')) return false;\n" +
+        "    if (isCategoryFullForType(type)) return false;\n" +
         "\n" +
         "    if (type !== 'IMAGE' && lower.indexOf('.m3u8') === -1 && lower.indexOf('.mpd') === -1) {\n" +
-        "      if (lower.indexOf('.ts?') !== -1 || lower.endsWith('.ts') || lower.indexOf('.m4s') !== -1) return;\n" +
+        "      if (lower.indexOf('.ts?') !== -1 || lower.endsWith('.ts') || lower.indexOf('.m4s') !== -1) return false;\n" +
         "    }\n" +
         "\n" +
         "    var absThumb = thumb ? toAbsolute(thumb) : '';\n" +
@@ -123,24 +174,38 @@ public final class MediaSnifferJs {
         "      flushQueue();\n" +
         "      try {\n" +
         "        window.BraveMediaBridge.onMediaFound(BRIDGE_TOKEN, JSON.stringify(payload));\n" +
-        "      } catch(e) {}\n" +
+        "        return true;\n" +
+        "      } catch(e) { return false; }\n" +
         "    } else {\n" +
-        "      if (pendingQueue.length < 150) pendingQueue.push(payload);\n" +
+        "      if (pendingQueue.length < MAX_PENDING_MEDIA) {\n" +
+        "        pendingQueue.push(payload);\n" +
+        "        return true;\n" +
+        "      }\n" +
+        "      queueOverflowed = true;\n" +
+        "      return false;\n" +
         "    }\n" +
         "  }\n" +
         "\n" +
         "  function checkAndReport(url, type, mime, title, w, h, s, d, thumb, quality) {\n" +
         "    if (!url) return;\n" +
         "    var absUrl = toAbsolute(url);\n" +
-        "    if (reportedUrls.has(absUrl)) {\n" +
-        "      if (thumb || quality) {\n" +
-        "        report(absUrl, type, mime, title, w, h, s, d, thumb, quality);\n" +
+        "    if (!absUrl) return;\n" +
+        "    if (absUrl.indexOf('google-analytics') !== -1 || absUrl.indexOf('/telemetry') !== -1) return;\n" +
+        "    if (isCategoryFullForType(type)) return;\n" +
+        "    var urlKey = type + '|' + absUrl;\n" +
+        "    var metaKey = urlKey + '|' + (thumb || '') + '|' + (quality || '');\n" +
+        "    if (reportedUrls.has(urlKey)) {\n" +
+        "      if ((thumb || quality) && !reportedMeta.has(metaKey)) {\n" +
+        "        if (report(absUrl, type, mime, title, w, h, s, d, thumb, quality)) {\n" +
+        "          markBoundedKey(reportedMeta, metaKey);\n" +
+        "        }\n" +
         "      }\n" +
         "      return;\n" +
         "    }\n" +
-        "    if (absUrl.indexOf('google-analytics') !== -1 || absUrl.indexOf('/telemetry') !== -1) return;\n" +
-        "    reportedUrls.add(absUrl);\n" +
-        "    report(absUrl, type, mime, title, w, h, s, d, thumb, quality);\n" +
+        "    if (report(absUrl, type, mime, title, w, h, s, d, thumb, quality)) {\n" +
+        "      markBoundedKey(reportedUrls, urlKey);\n" +
+        "      if (thumb || quality) markBoundedKey(reportedMeta, metaKey);\n" +
+        "    }\n" +
         "  }\n" +
         "\n" +
         "  function inspectUrl(rawUrl, contentType, thumb, quality) {\n" +
@@ -176,47 +241,88 @@ public final class MediaSnifferJs {
         "    var lower = abs.toLowerCase();\n" +
         "    if (!lower.startsWith('http://') && !lower.startsWith('https://')) return;\n" +
         "    if (lower.indexOf('google') !== -1 || lower.indexOf('doubleclick') !== -1 || lower.indexOf('facebook') !== -1) return;\n" +
-        "    reportedUrls.add('iframe:' + abs);\n" +
+        "    if (isCategoryFullForType('VIDEO')) return;\n" +
         "    if (window.BraveMediaBridge && window.BraveMediaBridge.onIframeDetected) {\n" +
         "      flushQueue();\n" +
         "      try {\n" +
         "        window.BraveMediaBridge.onIframeDetected(BRIDGE_TOKEN, abs, window.location.href);\n" +
+        "        markBoundedKey(reportedUrls, 'iframe:' + abs);\n" +
         "      } catch(e) {}\n" +
         "    } else {\n" +
-        "      if (pendingIframeQueue.length < 50) pendingIframeQueue.push({ url: abs, referer: window.location.href });\n" +
+        "      if (pendingIframeQueue.length < MAX_PENDING_IFRAMES) {\n" +
+        "        pendingIframeQueue.push({ url: abs, referer: window.location.href });\n" +
+        "        markBoundedKey(reportedUrls, 'iframe:' + abs);\n" +
+        "      } else {\n" +
+        "        queueOverflowed = true;\n" +
+        "      }\n" +
         "    }\n" +
+        "  }\n" +
+        "\n" +
+        "  function isPlaceholderSrc(val) {\n" +
+        "    if (!val || typeof val !== 'string') return true;\n" +
+        "    var s = val.trim().toLowerCase();\n" +
+        "    if (!s || s.startsWith('data:') || s.startsWith('blob:') || s.startsWith('about:')) return true;\n" +
+        "    if (!s.startsWith('http://') && !s.startsWith('https://') && s.indexOf('/') !== 0) return true;\n" +
+        "    if (/(?:^|[\\/._-])(1x1|blank|spacer|placeholder|loading)\\b/i.test(s)) return true;\n" +
+        "    return false;\n" +
         "  }\n" +
         "\n" +
         "  function inspectImage(img) {\n" +
         "    if (!img) return;\n" +
         "    try {\n" +
-        "      var src = img.currentSrc || img.src || (img.getAttribute && (img.getAttribute('data-src') || img.getAttribute('data-original') || img.getAttribute('data-lazy-src') || img.getAttribute('src')));\n" +
-        "      if (!src) return;\n" +
-        "      var abs = toAbsolute(src);\n" +
-        "      if (!abs) return;\n" +
-        "      var lower = abs.toLowerCase();\n" +
-        "      if (!lower.startsWith('http://') && !lower.startsWith('https://')) return;\n" +
-        "\n" +
-        "      if (lower.indexOf('.svg') !== -1) return;\n" +
-        "      if (lower.indexOf('google-analytics') !== -1 || lower.indexOf('doubleclick') !== -1) return;\n" +
-        "      if (lower.indexOf('/avatar') !== -1 || lower.indexOf('avatar.') !== -1) return;\n" +
-        "      if (lower.indexOf('logo-') !== -1 || lower.indexOf('/logo.') !== -1 || lower.indexOf('/logos/') !== -1) return;\n" +
-        "      if (lower.indexOf('/icon') !== -1 || lower.indexOf('emoji') !== -1) return;\n" +
-        "\n" +
-        "      var w = img.naturalWidth || img.width || 0;\n" +
-        "      var h = img.naturalHeight || img.height || 0;\n" +
-        "      if (w > 0 && w < 120 && h > 0 && h < 120) return;\n" +
-        "\n" +
-        "      var isGif = /\\.gif(?:[?#]|$)/i.test(lower);\n" +
-        "      var isImgExt = /\\.(?:jpg|jpeg|jfif|pjpeg|png|webp|gif|avif|bmp|heic|heif|tif|tiff)(?:[?#]|$)/i.test(lower);\n" +
-        "      if (isImgExt || (w >= 250 && h >= 250)) {\n" +
-        "        var alt = img.getAttribute ? (img.getAttribute('alt') || img.getAttribute('title') || '') : '';\n" +
-        "        checkAndReport(abs, 'IMAGE', isGif ? 'image/gif' : '', alt, w, h, 0, 0, abs, '');\n" +
-        "        if (isGif && (w === 0 || w >= 150)) {\n" +
-        "          checkAndReport(abs, 'VIDEO', 'image/gif', alt, w, h, 0, 0, abs, 'GIF');\n" +
+        "      var candidates = [];\n" +
+        "      if (img.getAttribute) {\n" +
+        "        var ds = img.getAttribute('data-src');\n" +
+        "        var dor = img.getAttribute('data-original');\n" +
+        "        var dlz = img.getAttribute('data-lazy-src');\n" +
+        "        if (ds) candidates.push(ds);\n" +
+        "        if (dor) candidates.push(dor);\n" +
+        "        if (dlz) candidates.push(dlz);\n" +
+        "      }\n" +
+        "      if (img.currentSrc) candidates.push(img.currentSrc);\n" +
+        "      if (img.src) candidates.push(img.src);\n" +
+        "      if (img.getAttribute) {\n" +
+        "        var rawSrcAttr = img.getAttribute('src');\n" +
+        "        if (rawSrcAttr) candidates.push(rawSrcAttr);\n" +
+        "      }\n" +
+        "      var src = '';\n" +
+        "      for (var ci = 0; ci < candidates.length; ci++) {\n" +
+        "        var cand = candidates[ci];\n" +
+        "        if (!cand) continue;\n" +
+        "        var absCand = toAbsolute(cand);\n" +
+        "        if (!isPlaceholderSrc(absCand)) {\n" +
+        "          src = absCand;\n" +
+        "          break;\n" +
         "        }\n" +
         "      }\n" +
-        "      var srcset = img.srcset || (img.getAttribute ? img.getAttribute('srcset') : '');\n" +
+        "      var abs = src ? toAbsolute(src) : '';\n" +
+        "      if (abs) {\n" +
+        "        var lower = abs.toLowerCase();\n" +
+        "        if (lower.startsWith('http://') || lower.startsWith('https://')) {\n" +
+        "          if (lower.indexOf('.svg') === -1\n" +
+        "              && lower.indexOf('google-analytics') === -1 && lower.indexOf('doubleclick') === -1\n" +
+        "              && lower.indexOf('/avatar') === -1 && lower.indexOf('avatar.') === -1\n" +
+        "              && lower.indexOf('logo-') === -1 && lower.indexOf('/logo.') === -1 && lower.indexOf('/logos/') === -1\n" +
+        "              && lower.indexOf('/icon') === -1 && lower.indexOf('emoji') === -1) {\n" +
+        "            var activeUrl = toAbsolute(img.currentSrc || img.src || '');\n" +
+        "            var loadedMatchesSrc = (activeUrl === abs);\n" +
+        "            var w = loadedMatchesSrc ? (img.naturalWidth || img.width || 0) : (parseInt(img.getAttribute && img.getAttribute('width') || '0', 10) || 0);\n" +
+        "            var h = loadedMatchesSrc ? (img.naturalHeight || img.height || 0) : (parseInt(img.getAttribute && img.getAttribute('height') || '0', 10) || 0);\n" +
+        "            if (!(w > 0 && w < 120 && h > 0 && h < 120)) {\n" +
+        "              var isGif = /\\.gif(?:[?#]|$)/i.test(lower);\n" +
+        "              var isImgExt = /\\.(?:jpg|jpeg|jfif|pjpeg|png|webp|gif|avif|bmp|heic|heif|tif|tiff)(?:[?#]|$)/i.test(lower);\n" +
+        "              if (isImgExt || (w >= 250 && h >= 250)) {\n" +
+        "                var alt = img.getAttribute ? (img.getAttribute('alt') || img.getAttribute('title') || '') : '';\n" +
+        "                checkAndReport(abs, 'IMAGE', isGif ? 'image/gif' : '', alt, w, h, 0, 0, abs, '');\n" +
+        "                if (isGif && (w === 0 || w >= 150)) {\n" +
+        "                  checkAndReport(abs, 'VIDEO', 'image/gif', alt, w, h, 0, 0, abs, 'GIF');\n" +
+        "                }\n" +
+        "              }\n" +
+        "            }\n" +
+        "          }\n" +
+        "        }\n" +
+        "      }\n" +
+        "      var srcset = (img.getAttribute ? (img.getAttribute('data-srcset') || img.getAttribute('srcset')) : '') || img.srcset || '';\n" +
         "      if (srcset) {\n" +
         "        var parts = srcset.split(',');\n" +
         "        var bestPart = parts[parts.length - 1];\n" +
@@ -224,8 +330,10 @@ public final class MediaSnifferJs {
         "          var bestUrl = bestPart.trim().split(/\\s+/)[0];\n" +
         "          if (bestUrl && bestUrl !== src) {\n" +
         "            var absBest = toAbsolute(bestUrl);\n" +
-        "            if (absBest && absBest !== abs) {\n" +
-        "              checkAndReport(absBest, 'IMAGE', '', '', w, h, 0, 0, absBest, '');\n" +
+        "            if (absBest && absBest !== abs && !isPlaceholderSrc(absBest)) {\n" +
+        "              var sw = img.naturalWidth || img.width || 0;\n" +
+        "              var sh = img.naturalHeight || img.height || 0;\n" +
+        "              checkAndReport(absBest, 'IMAGE', '', '', sw, sh, 0, 0, absBest, '');\n" +
         "            }\n" +
         "          }\n" +
         "        }\n" +
@@ -318,10 +426,40 @@ public final class MediaSnifferJs {
         "          } catch(e) {}\n" +
         "          inspectUrl(resUrl, ct, '', '');\n" +
         "\n" +
-        "          if (cl <= MAX_TEXT_SCAN_LEN && isInspectableTextType(ct, resUrl)) {\n" +
-        "            res.clone().text().then(function(txt) {\n" +
-        "              inspectResponseText(txt, ct, resUrl);\n" +
-        "            }).catch(function(){});\n" +
+        "          if ((cl === 0 || cl <= MAX_TEXT_SCAN_LEN) && isInspectableTextType(ct, resUrl)) {\n" +
+        "            try {\n" +
+        "              var cloned = res.clone();\n" +
+        "              if (cloned.body && typeof cloned.body.getReader === 'function' && typeof TextDecoder !== 'undefined') {\n" +
+        "                (function(rUrl, rCt, cRes) {\n" +
+        "                  var reader = cRes.body.getReader();\n" +
+        "                  var decoder = new TextDecoder('utf-8', { fatal: false });\n" +
+        "                  var totalBytes = 0;\n" +
+        "                  var chunks = '';\n" +
+        "                  function pump() {\n" +
+        "                    return reader.read().then(function(step) {\n" +
+        "                      if (step.done) {\n" +
+        "                        chunks += decoder.decode();\n" +
+        "                        inspectResponseText(chunks, rCt, rUrl);\n" +
+        "                        return;\n" +
+        "                      }\n" +
+        "                      var val = step.value;\n" +
+        "                      totalBytes += (val ? val.byteLength : 0);\n" +
+        "                      if (totalBytes > MAX_TEXT_SCAN_LEN) {\n" +
+        "                        try { reader.cancel(); } catch(e) {}\n" +
+        "                        return;\n" +
+        "                      }\n" +
+        "                      chunks += decoder.decode(val, { stream: true });\n" +
+        "                      return pump();\n" +
+        "                    });\n" +
+        "                  }\n" +
+        "                  pump().catch(function(){});\n" +
+        "                })(resUrl, ct, cloned);\n" +
+        "              } else if (cl > 0 && cl <= MAX_TEXT_SCAN_LEN) {\n" +
+        "                cloned.text().then(function(txt) {\n" +
+        "                  inspectResponseText(txt, ct, resUrl);\n" +
+        "                }).catch(function(){});\n" +
+        "              }\n" +
+        "            } catch(e) {}\n" +
         "          }\n" +
         "        } catch(e) {}\n" +
         "        return res;\n" +
@@ -419,13 +557,14 @@ public final class MediaSnifferJs {
         "\n" +
         "  function scanScriptElement(sc) {\n" +
         "    if (!sc) return;\n" +
-        "    if (scannedScripts) {\n" +
-        "      if (scannedScripts.has(sc)) return;\n" +
-        "      scannedScripts.add(sc);\n" +
-        "    }\n" +
         "    try {\n" +
         "      var stxt = sc.textContent;\n" +
         "      if (!stxt || stxt.length < 20 || stxt.length > MAX_TEXT_SCAN_LEN) return;\n" +
+        "      var sig = stxt.length + ':' + stxt.slice(0, 64) + ':' + stxt.slice(-64);\n" +
+        "      if (scannedScripts) {\n" +
+        "        if (scannedScripts.get(sc) === sig) return;\n" +
+        "        scannedScripts.set(sc, sig);\n" +
+        "      }\n" +
         "      if (stxt.indexOf('.m3u8') !== -1 || stxt.indexOf('.mpd') !== -1 || stxt.indexOf('.mp4') !== -1 || stxt.indexOf('master') !== -1) {\n" +
         "        var smatches = stxt.match(/https?:\\/\\/[^\\s\"'<>]+?\\.(?:m3u8|mp4|mpd|webm)[^\\s\"'<>]*/g);\n" +
         "        if (smatches) {\n" +
@@ -435,8 +574,11 @@ public final class MediaSnifferJs {
         "    } catch(e) {}\n" +
         "  }\n" +
         "\n" +
+        "  // Note: Traverses open Shadow DOM roots (and newly created roots wrapped below);\n" +
+        "  // closed Shadow DOM roots created before injection cannot be reached from page context.\n" +
         "  function scanNodeSubtree(root) {\n" +
-        "    if (!root || root.nodeType !== 1 && root.nodeType !== 9) return;\n" +
+        "    if (!root || (root.nodeType !== 1 && root.nodeType !== 9 && root.nodeType !== 11)) return;\n" +
+        "    if (root.nodeType === 11) observeRoot(root);\n" +
         "    if (root.nodeType === 1) {\n" +
         "      var tag = root.tagName;\n" +
         "      if (tag === 'VIDEO' || tag === 'AUDIO') scanMediaElement(root);\n" +
@@ -451,6 +593,7 @@ public final class MediaSnifferJs {
         "          scanMediaElement(root.parentElement);\n" +
         "        }\n" +
         "      }\n" +
+        "      if (root.shadowRoot) scanNodeSubtree(root.shadowRoot);\n" +
         "    }\n" +
         "    if (!root.querySelectorAll) return;\n" +
         "    try {\n" +
@@ -490,6 +633,12 @@ public final class MediaSnifferJs {
         "    try {\n" +
         "      var scripts = root.querySelectorAll('script');\n" +
         "      for (var si = 0; si < scripts.length; si++) scanScriptElement(scripts[si]);\n" +
+        "    } catch(e) {}\n" +
+        "    try {\n" +
+        "      var allEls = root.querySelectorAll('*');\n" +
+        "      for (var ai = 0; ai < allEls.length; ai++) {\n" +
+        "        if (allEls[ai].shadowRoot) scanNodeSubtree(allEls[ai].shadowRoot);\n" +
+        "      }\n" +
         "    } catch(e) {}\n" +
         "  }\n" +
         "\n" +
@@ -541,17 +690,31 @@ public final class MediaSnifferJs {
         "    try { scanDom(); flushQueue(); } catch(e) {}\n" +
         "  };\n" +
         "\n" +
-        "  // 6. Incremental MutationObserver (processes only added/mutated elements)\n" +
+        "  // 6. Incremental MutationObserver (processes added/mutated elements, script text changes, and Shadow DOM)\n" +
         "  var dirtyNodes = new Set();\n" +
         "  var debounceTimer = null;\n" +
+        "  var OBSERVER_OPTS = {\n" +
+        "    childList: true,\n" +
+        "    subtree: true,\n" +
+        "    characterData: true,\n" +
+        "    attributes: true,\n" +
+        "    attributeFilter: ['src', 'srcset', 'data-src', 'data-original', 'data-lazy-src', 'data-srcset']\n" +
+        "  };\n" +
         "  var observer = new MutationObserver(function(mutations) {\n" +
         "    for (var i = 0; i < mutations.length; i++) {\n" +
         "      var m = mutations[i];\n" +
         "      if (m.type === 'attributes' && m.target && m.target.nodeType === 1) {\n" +
         "        dirtyNodes.add(m.target);\n" +
+        "      } else if (m.type === 'characterData' && m.target && m.target.parentElement && m.target.parentElement.tagName === 'SCRIPT') {\n" +
+        "        dirtyNodes.add(m.target.parentElement);\n" +
         "      } else if (m.addedNodes) {\n" +
         "        for (var j = 0; j < m.addedNodes.length; j++) {\n" +
-        "          if (m.addedNodes[j].nodeType === 1) dirtyNodes.add(m.addedNodes[j]);\n" +
+        "          var added = m.addedNodes[j];\n" +
+        "          if (added.nodeType === 1) {\n" +
+        "            dirtyNodes.add(added);\n" +
+        "          } else if (added.nodeType === 3 && added.parentElement && added.parentElement.tagName === 'SCRIPT') {\n" +
+        "            dirtyNodes.add(added.parentElement);\n" +
+        "          }\n" +
         "        }\n" +
         "      }\n" +
         "    }\n" +
@@ -566,17 +729,38 @@ public final class MediaSnifferJs {
         "      flushQueue();\n" +
         "    }, 250);\n" +
         "  });\n" +
+        "  function observeRoot(rootNode) {\n" +
+        "    if (!rootNode || !observer) return;\n" +
+        "    if (observedRoots) {\n" +
+        "      if (observedRoots.has(rootNode)) return;\n" +
+        "      observedRoots.add(rootNode);\n" +
+        "    }\n" +
+        "    try { observer.observe(rootNode, OBSERVER_OPTS); } catch(e) {}\n" +
+        "  }\n" +
         "  function attachObserver() {\n" +
         "    var rootNode = document.documentElement || document.body;\n" +
         "    if (rootNode) {\n" +
-        "      observer.observe(rootNode, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'srcset', 'data-src'] });\n" +
+        "      observeRoot(rootNode);\n" +
         "    } else {\n" +
         "      document.addEventListener('DOMContentLoaded', function() {\n" +
-        "        if (document.documentElement) observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'srcset', 'data-src'] });\n" +
+        "        if (document.documentElement) observeRoot(document.documentElement);\n" +
         "      });\n" +
         "    }\n" +
         "  }\n" +
         "  attachObserver();\n" +
+        "  try {\n" +
+        "    var origSniffAttachShadow = Element.prototype.attachShadow;\n" +
+        "    if (origSniffAttachShadow) {\n" +
+        "      Element.prototype.attachShadow = function() {\n" +
+        "        var sr = origSniffAttachShadow.apply(this, arguments);\n" +
+        "        if (sr) {\n" +
+        "          observeRoot(sr);\n" +
+        "          setTimeout(function() { try { scanNodeSubtree(sr); flushQueue(); } catch(e) {} }, 50);\n" +
+        "        }\n" +
+        "        return sr;\n" +
+        "      };\n" +
+        "    }\n" +
+        "  } catch(e) {}\n" +
         "\n" +
         "  // Lightweight SPA URL-change watcher (does NOT rescan DOM unless URL changed)\n" +
         "  setInterval(function() {\n" +

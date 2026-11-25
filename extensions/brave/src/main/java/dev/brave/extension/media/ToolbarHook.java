@@ -36,13 +36,15 @@ public final class ToolbarHook {
     private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
 
     private static class ToolbarViewHolder {
+        final WeakReference<Activity> activityRef;
         final WeakReference<FrameLayout> container;
         final WeakReference<ImageView> icon;
         final WeakReference<TextView> badge;
         ColorStateList currentTint;
         boolean isUrlFocused;
 
-        ToolbarViewHolder(FrameLayout container, ImageView icon, TextView badge) {
+        ToolbarViewHolder(Activity activity, FrameLayout container, ImageView icon, TextView badge) {
+            this.activityRef = new WeakReference<>(activity);
             this.container = new WeakReference<>(container);
             this.icon = new WeakReference<>(icon);
             this.badge = new WeakReference<>(badge);
@@ -71,12 +73,23 @@ public final class ToolbarHook {
         );
 
         MediaRegistry.addListener((tabId, mediaCount, imageCount) -> {
-            int activeId = ActiveTabTracker.getActiveTabId();
-            android.util.Log.i(TAG, "Media count changed: tabId=" + tabId + ", activeId=" + activeId + ", count=" + (mediaCount + imageCount));
-            if (activeId < 0) {
-                updateBadgeCount(0);
-            } else if (tabId == activeId) {
-                updateBadgeCount(mediaCount + imageCount);
+            Runnable updateTask = () -> {
+                for (ToolbarViewHolder holder : TOOLBAR_MAP.values()) {
+                    Activity act = holder.activityRef.get();
+                    int holderActiveId = (act != null)
+                            ? ActiveTabTracker.getActiveTabId(act)
+                            : ActiveTabTracker.getActiveTabId();
+                    if (holderActiveId < 0) {
+                        updateBadgeCountForHolder(holder, 0);
+                    } else if (tabId == holderActiveId) {
+                        updateBadgeCountForHolder(holder, mediaCount + imageCount);
+                    }
+                }
+            };
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                updateTask.run();
+            } else {
+                MAIN_HANDLER.post(updateTask);
             }
         });
     }
@@ -125,7 +138,10 @@ public final class ToolbarHook {
 
                 TOOLBAR_MAP.put(toolbar, holder);
 
-                int activeTabId = ActiveTabTracker.getActiveTabId();
+                Activity act = getActivityFromContext(ctx);
+                int activeTabId = (act != null)
+                        ? ActiveTabTracker.getActiveTabId(act)
+                        : ActiveTabTracker.getActiveTabId();
                 if (activeTabId >= 0) {
                     int totalCount = MediaRegistry.getMediaCount(activeTabId) + MediaRegistry.getImageCount(activeTabId);
                     updateBadgeCountForHolder(holder, totalCount);
@@ -364,7 +380,7 @@ public final class ToolbarHook {
         container.setOnClickListener(v -> {
             Activity act = getActivityFromContext(v.getContext());
             if (act != null) {
-                org.chromium.chrome.browser.tab.Tab activeTab = ActiveTabTracker.getActiveTab();
+                org.chromium.chrome.browser.tab.Tab activeTab = ActiveTabTracker.getActiveTab(act);
                 if (activeTab != null && activeTab.getWebContents() != null) {
                     JsInjectionHub.executeScript(activeTab, activeTab.getWebContents(), "try { if (window.__brave_scan_media__) window.__brave_scan_media__(); } catch(e) {}");
                 }
@@ -372,7 +388,7 @@ public final class ToolbarHook {
             }
         });
 
-        return new ToolbarViewHolder(container, iconView, badgeView);
+        return new ToolbarViewHolder(getActivityFromContext(context), container, iconView, badgeView);
     }
 
     private static Activity getActivityFromContext(Context ctx) {

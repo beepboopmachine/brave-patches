@@ -51,7 +51,7 @@ public class MediaItem implements Serializable {
     }
 
     public final String id;
-    public final MediaType type;
+    public volatile MediaType type;
     public final String url;
     public volatile String title;
     public volatile String mimeType;
@@ -151,12 +151,30 @@ public class MediaItem implements Serializable {
         if (quality != null && !quality.trim().isEmpty()) this.qualityLabel = quality.trim();
     }
 
+    public static int typePriority(MediaType t) {
+        if (t == null) return 0;
+        switch (t) {
+            case HLS_STREAM: return 4;
+            case DASH_STREAM: return 3;
+            case VIDEO:
+            case AUDIO: return 2;
+            case IMAGE: return 1;
+            default: return 0;
+        }
+    }
+
     /**
      * Merges all enriched metadata, authentication context, audio track URL, and HLS variants
-     * from a richer duplicate entry into this canonical item.
+     * from a richer duplicate entry into this canonical item, upgrading classification type
+     * if the incoming item has higher specificity (e.g. VIDEO -> HLS_STREAM).
      */
-    public synchronized void mergeFrom(MediaItem other) {
-        if (other == null || other == this) return;
+    public synchronized boolean mergeFrom(MediaItem other) {
+        if (other == null || other == this) return false;
+        boolean upgradedType = false;
+        if (typePriority(other.type) > typePriority(this.type)) {
+            this.type = other.type;
+            upgradedType = true;
+        }
         updateEnrichedMetadata(other.title, other.mimeType, other.width, other.height,
                 other.sizeBytes, other.durationMs, other.thumbnailUrl, other.qualityLabel);
 
@@ -183,6 +201,7 @@ public class MediaItem implements Serializable {
         if (this.variants.isEmpty() && !other.variants.isEmpty()) {
             this.variants.addAll(other.variants);
         }
+        return upgradedType;
     }
 
     public String getQualityLabel() {
